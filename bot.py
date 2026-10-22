@@ -45,6 +45,7 @@ import insta
 import memes
 import refs
 import search
+import users
 
 # ---------------------------------------------------------------------------
 # Константы (значения по умолчанию — из docs.x.ai, 22.10.2026)
@@ -199,6 +200,9 @@ class Config:
     search_max_sources: int = 5
     search_tools: str = "web,x"
     search_max_tool_calls: int | None = None
+    # доступ: заявки от новых пользователей
+    access_requests: bool = True
+    access_request_cooldown_sec: float = 3600.0
 
     def image_price(self, resolution: str | None, quality: str = "low") -> float:
         p = self.price_image + PRICE_IMAGE_RES_ADD.get((resolution or "1k").lower(), 0.0)
@@ -271,6 +275,8 @@ class Config:
             search_max_sources=max(0, min(10, int(_float("SEARCH_MAX_SOURCES", 5)))),
             search_tools=_env("SEARCH_TOOLS") or "web,x",
             search_max_tool_calls=(int(_float("SEARCH_MAX_TOOL_CALLS", 0)) or None),
+            access_requests=_env("ACCESS_REQUESTS").lower() not in ("0", "false", "no", "off", "нет"),
+            access_request_cooldown_sec=max(0.0, _float("ACCESS_REQUEST_COOLDOWN_SEC", 3600.0)),
         )
 
 
@@ -872,11 +878,43 @@ REF_HELP = (
     "• noref — не использовать сохранённые референсы\n\n"
     "/ref clear — удалить сохранённые фото."
 )
-ADMIN_HELP = "\n\nДля админа: /setbalance <сумма в $> — указать текущий остаток вручную."
-NO_ACCESS = (
-    "⛔ У вас нет доступа к этому боту.\n"
-    "Отправьте /myid, перешлите свой ID владельцу бота — он добавит вас в список разрешённых."
+ADMIN_HELP = (
+    "\n\nДля админа:\n"
+    "/setbalance <сумма в $> — указать текущий остаток вручную\n"
+    "/adduser <ID> [заметка] — дать доступ (или ответьте /adduser на пересланное сообщение пользователя)\n"
+    "/deluser <ID> — забрать доступ, выданный командой или по заявке\n"
+    "/users — кто имеет доступ и ожидающие заявки\n"
+    "Заявки на доступ приходят сюда с кнопками «✅ Пустить» / «❌ Отказать»."
 )
+NO_ACCESS = "⛔ У вас нет доступа к этому боту — он работает по приглашению."
+STRANGER_HELLO = "Привет! Это частный бот-посредник к Grok (xAI)."
+ACCESS_BUTTON = "🙋 Запросить доступ"
+ACCESS_GRANTED = "✅ Доступ открыт! Отправьте /start, чтобы увидеть команды, или просто напишите сообщение."
+
+
+def fmt_wait(sec: float) -> str:
+    m = max(1, int(sec // 60 + (1 if sec % 60 else 0)))
+    if m < 60:
+        return f"{m} мин"
+    h, mm = divmod(m, 60)
+    return f"{h} ч" + (f" {mm} мин" if mm else "")
+
+
+def user_label(u) -> tuple[str, str]:
+    """(имя, username) из aiogram User/Chat."""
+    name = " ".join(x for x in (getattr(u, "first_name", None), getattr(u, "last_name", None)) if x)
+    return name or (getattr(u, "title", None) or ""), getattr(u, "username", None) or ""
+
+
+def access_request_text(uid: int, rec: dict) -> str:
+    """Сообщение админу о заявке (HTML)."""
+    name = html.escape(rec.get("name") or "без имени")
+    un = rec.get("username") or ""
+    return ("🙋 <b>Заявка на доступ к боту</b>\n"
+            f"Имя: <a href=\"tg://user?id={uid}\">{name}</a>\n"
+            f"Username: {'@' + html.escape(un) if un else '—'}\n"
+            f"ID: <code>{uid}</code>\n"
+            f"Время: {users.fmt_ts(rec.get('ts'))}")
 
 
 def error_text(e: XAIError) -> str:
@@ -953,16 +991,43 @@ def source_text(info: BalanceInfo, tracker: BalanceTracker) -> str:
 # ---------------------------------------------------------------------------
 # Бот
 # ---------------------------------------------------------------------------
-def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Dispatcher:
+def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
+                     user_store: users.UserStore | None = None) -> Dispatcher:
     dp = Dispatcher()
     history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_TURNS * 2))
     locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+    if user_store is None:
+        user_store = users.UserStore(cfg.data_dir, cfg.access_request_cooldown_sec)
+    dp["user_store"] = user_store  # для тестов/отладки
+
+    def uid_allowed(uid: int | None) -> bool:
+        """ALLOWED_USER_IDS ∪ ADMIN_USER_IDS (cfg.allowed_user_ids) ∪ добавленные командой/по заявке."""
+        return uid is not None and (uid in cfg.allowed_user_ids or uid in user_store)
 
     def allowed(m: Message) -> bool:
-        return bool(m.from_user) and m.from_user.id in cfg.allowed_user_ids
+        return bool(m.from_user) and uid_allowed(m.from_user.id)
 
     def is_admin(m: Message) -> bool:
         return bool(m.from_user) and m.from_user.id in cfg.admin_user_ids
+
+    def access_text_and_kb(uid: int | None) -> tuple[str, InlineKeyboardMarkup | None]:
+        """Текст для пользователя без доступа + кнопка «Запросить доступ», если заявку можно подать."""
+        if not cfg.admin_user_ids:
+            return NO_ACCESS + "\nСвяжитесь с владельцем бота и отправьте ему свой ID (команда /myid).", None
+        if not cfg.access_requests:
+            return NO_ACCESS + "\nОтправьте /myid и перешлите свой ID владельцу бота — он добавит вас.", None
+        st = user_store.request_state(uid) if uid is not None else None
+        if st and st.status == "pending":
+            return NO_ACCESS + "\n⏳ Ваша заявка уже у администратора — я напишу, когда он ответит.", None
+        if st and st.status == "cooldown":
+            return (NO_ACCESS + f"\nАдминистратор пока не открыл доступ. Повторить заявку можно через "
+                    f"{fmt_wait(st.wait_sec)}."), None
+        kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=ACCESS_BUTTON, callback_data="acc:req")]])
+        return NO_ACCESS + "\nНажмите кнопку — администратор получит заявку и решит, открыть ли доступ.", kb
+
+    async def deny(m: Message) -> None:
+        text, kb = access_text_and_kb(m.from_user.id if m.from_user else None)
+        await m.answer(text, reply_markup=kb)
 
     async def notify_admins(bot: Bot, crossed: list[float], info: BalanceInfo) -> None:
         for t in crossed:
@@ -986,10 +1051,11 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
 
     @dp.message(CommandStart())
     async def cmd_start(m: Message) -> None:
-        text = HELP + (ADMIN_HELP if is_admin(m) else "")
         if not allowed(m):
-            text += "\n\n" + NO_ACCESS
-        await m.answer(text)
+            text, kb = access_text_and_kb(m.from_user.id if m.from_user else None)
+            await m.answer(STRANGER_HELLO + "\n\n" + text, reply_markup=kb)
+            return
+        await m.answer(HELP + (ADMIN_HELP if is_admin(m) else ""))
 
     @dp.message(Command("myid"))
     async def cmd_myid(m: Message) -> None:
@@ -999,7 +1065,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
     @dp.message(Command("new"))
     async def cmd_new(m: Message) -> None:
         if not allowed(m):
-            await m.answer(NO_ACCESS)
+            await deny(m)
             return
         history.pop(m.from_user.id, None)
         await m.answer("🧹 История очищена. Начинаем новый диалог!")
@@ -1007,7 +1073,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
     @dp.message(Command("balance"))
     async def cmd_balance(m: Message, bot: Bot) -> None:
         if not allowed(m):
-            await m.answer(NO_ACCESS)
+            await deny(m)
             return
         info, crossed = await tracker.get(force_refresh=True)
         if crossed:
@@ -1048,10 +1114,252 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
             msg += "\n⚠️ DATA_DIR недоступен для записи — значение сбросится при перезапуске."
         await m.answer(msg)
 
+    # ------------------------------------------------------------------
+    # Управление пользователями (админ) и заявки на доступ
+    # ------------------------------------------------------------------
+    def admin_name(u) -> str:
+        n, un = user_label(u)
+        return users.display_name({"name": n, "username": un})
+
+    def target_from_message(m: Message, args: str) -> tuple[int | None, str, str, str]:
+        """(id, имя, username, остаток аргументов) из «/cmd <id> …» или из ответа на пересланное сообщение."""
+        parts = args.split(maxsplit=1)
+        if parts and users.parse_user_id(parts[0]) is not None:
+            return users.parse_user_id(parts[0]), "", "", (parts[1] if len(parts) > 1 else "").strip()
+        r = m.reply_to_message
+        if r is not None:
+            fo = r.forward_origin
+            su = getattr(fo, "sender_user", None) if fo is not None else None
+            if su is None and r.forward_from is not None:
+                su = r.forward_from
+            if su is not None and not su.is_bot:
+                n, un = user_label(su)
+                return su.id, n, un, args.strip()
+        return None, "", "", args.strip()
+
+    async def lookup(bot: Bot, uid: int) -> tuple[str, str]:
+        """Имя и username по ID — получится, только если пользователь уже писал боту."""
+        try:
+            ch = await bot.get_chat(uid)
+            if getattr(ch, "id", None) == uid:
+                return user_label(ch)
+        except Exception as e:  # noqa: BLE001 — не критично
+            log.debug("get_chat %s: %s", uid, e)
+        return "", ""
+
+    async def close_request_msgs(bot: Bot, uid: int, rec: dict, line: str, extra: Message | None = None) -> None:
+        """Убрать кнопки у сообщений-заявок у всех админов и дописать итог."""
+        targets = [tuple(x) for x in rec.get("msgs") or []]
+        if extra is not None and (extra.chat.id, extra.message_id) not in targets:
+            targets.append((extra.chat.id, extra.message_id))
+        text = access_request_text(uid, rec) + "\n\n" + html.escape(line)
+        for chat_id, msg_id in targets:
+            try:
+                await bot.edit_message_text(text=text, chat_id=chat_id, message_id=msg_id,
+                                            parse_mode="HTML", reply_markup=None)
+            except (TelegramBadRequest, TelegramForbiddenError) as e:
+                log.debug("edit request msg %s/%s: %s", chat_id, msg_id, e)
+
+    async def notify_user(bot: Bot, uid: int, text: str) -> bool:
+        try:
+            await bot.send_message(uid, text)
+            return True
+        except (TelegramBadRequest, TelegramForbiddenError) as e:
+            log.info("не удалось написать пользователю %s: %s", uid, e)
+            return False
+
+    PERSIST_WARN = ("\n⚠️ DATA_DIR недоступен для записи — изменение действует только до перезапуска. "
+                    "Чтобы доступ был постоянным, добавьте ID в ALLOWED_USER_IDS.")
+
+    @dp.message(Command("adduser"))
+    async def cmd_adduser(m: Message, command: CommandObject, bot: Bot) -> None:
+        if not is_admin(m):
+            await m.answer("⛔ Эта команда только для администратора.")
+            return
+        uid, name, un, note = target_from_message(m, command.args or "")
+        if uid is None:
+            hidden = m.reply_to_message is not None and m.reply_to_message.forward_origin is not None
+            await m.answer(("😕 Пользователь скрыл свой аккаунт в пересылке — Telegram не показывает его ID. "
+                            "Попросите его отправить боту /myid или нажать «Запросить доступ».\n\n" if hidden else "")
+                           + "Использование: /adduser <ID> [заметка]\nНапример: /adduser 123456789 Маша, SMM\n"
+                           "Или ответьте командой /adduser на пересланное сообщение пользователя.\n"
+                           "ID пользователь может узнать командой /myid.")
+            return
+        if uid in cfg.admin_user_ids:
+            await m.answer(f"ℹ️ {uid} — администратор (ADMIN_USER_IDS), доступ у него и так есть.")
+            return
+        if uid in cfg.allowed_user_ids:
+            await m.answer(f"ℹ️ {uid} уже есть в настройках (ALLOWED_USER_IDS) — доступ у него и так есть.")
+            return
+        if not name and not un:
+            name, un = await lookup(bot, uid)
+        rec = user_store.get_pending(uid)
+        is_new = user_store.add(uid, name=name, username=un, note=note, added_by=m.from_user.id)
+        label = users.display_name(user_store.users[uid])
+        if rec:
+            await close_request_msgs(bot, uid, rec, f"✅ Добавлен командой /adduser ({admin_name(m.from_user)})")
+        if is_new:
+            sent_ok = await notify_user(bot, uid, ACCESS_GRANTED)
+            msg = (f"✅ Доступ открыт: {label}, ID {uid}" + (f" — {note}" if note else "") + "."
+                   + ("\nПользователь получил уведомление." if sent_ok else
+                      "\nУведомить не удалось (он ещё не писал боту) — пусть просто отправит /start."))
+        else:
+            msg = f"ℹ️ {label} (ID {uid}) уже был в списке" + (" — заметка обновлена." if note else ".")
+        if not user_store.persist_ok:
+            msg += PERSIST_WARN
+        await m.answer(msg)
+
+    @dp.message(Command("deluser"))
+    async def cmd_deluser(m: Message, command: CommandObject) -> None:
+        if not is_admin(m):
+            await m.answer("⛔ Эта команда только для администратора.")
+            return
+        uid, _, _, _ = target_from_message(m, command.args or "")
+        if uid is None:
+            await m.answer("Использование: /deluser <ID>\nСписок пользователей и их ID — /users.")
+            return
+        if uid in cfg.admin_user_ids:
+            await m.answer(f"⛔ {uid} — администратор (ADMIN_USER_IDS). Убрать его можно только в настройках "
+                           "бота (переменные окружения) с перезапуском.")
+            return
+        if uid in cfg.allowed_user_ids:
+            await m.answer(f"⛔ {uid} задан в настройках (ALLOWED_USER_IDS) — командой его не удалить. "
+                           "Уберите ID из переменной ALLOWED_USER_IDS на хостинге и перезапустите бота.")
+            return
+        rec = user_store.users.get(uid)
+        if not user_store.remove(uid):
+            await m.answer(f"ℹ️ {uid} нет в списке добавленных пользователей. Посмотреть список — /users.")
+            return
+        history.pop(uid, None)
+        msg = f"🗑 Доступ закрыт: {users.display_name(rec)}, ID {uid}."
+        if not user_store.persist_ok:
+            msg += PERSIST_WARN
+        await m.answer(msg)
+
+    @dp.message(Command("users"))
+    async def cmd_users(m: Message) -> None:
+        if not is_admin(m):
+            await m.answer("⛔ Эта команда только для администратора.")
+            return
+        lines = ["👥 Доступ к боту", "", f"Администраторы (ADMIN_USER_IDS) — {len(cfg.admin_user_ids)}:"]
+        lines += [f"• {u}" + (" (это вы)" if u == m.from_user.id else "") for u in sorted(cfg.admin_user_ids)] or ["• —"]
+        env_only = sorted(cfg.allowed_user_ids - cfg.admin_user_ids)
+        lines += ["", f"Из настроек (ALLOWED_USER_IDS, командой не удалить) — {len(env_only)}:"]
+        lines += [f"• {u}" for u in env_only] or ["• —"]
+        stored = sorted(((u, r) for u, r in user_store.users.items() if u not in cfg.allowed_user_ids),
+                        key=lambda x: x[1].get("added_at") or 0)
+        lines += ["", f"Добавлены командой или по заявке — {len(stored)}:"]
+        for u, r in stored:
+            line = f"• {u} — {users.display_name(r)}, добавлен {users.fmt_ts(r.get('added_at'))}"
+            if r.get("note"):
+                line += f" — {r['note']}"
+            lines.append(line)
+        if not stored:
+            lines.append("• —")
+        pend = user_store.pending()
+        if pend:
+            lines += ["", f"⏳ Ожидают ответа — {len(pend)}:"]
+            lines += [f"• {u} — {users.display_name(r)}, {users.fmt_ts(r.get('ts'))}" for u, r in sorted(pend.items())]
+        lines += ["", "Добавить: /adduser <ID> [заметка] · удалить: /deluser <ID>"]
+        if not user_store.persist_ok:
+            lines.append("⚠️ DATA_DIR недоступен для записи — добавленные пользователи пропадут при перезапуске.")
+        for chunk in split_text("\n".join(lines)):
+            await m.answer(chunk)
+
+    @dp.callback_query(F.data == "acc:req")
+    async def on_access_request(cq: CallbackQuery, bot: Bot) -> None:
+        u = cq.from_user
+        if not u or u.is_bot:
+            await cq.answer()
+            return
+        if uid_allowed(u.id):
+            await cq.answer("✅ У вас уже есть доступ — отправьте /start.", show_alert=True)
+            return
+        if not cfg.access_requests or not cfg.admin_user_ids:
+            await cq.answer("Заявки сейчас не принимаются. Свяжитесь с владельцем бота и отправьте ему свой ID (/myid).",
+                            show_alert=True)
+            return
+        name, un = user_label(u)
+        res = user_store.create_request(u.id, name, un)
+        if res.status == "pending":
+            await cq.answer("⏳ Заявка уже отправлена — дождитесь ответа администратора.", show_alert=True)
+            return
+        if res.status == "cooldown":
+            await cq.answer(f"Повторить заявку можно через {fmt_wait(res.wait_sec)}.", show_alert=True)
+            return
+        if res.status == "limit":
+            await cq.answer("Сейчас слишком много заявок. Попробуйте позже.", show_alert=True)
+            return
+        if res.status == "allowed":
+            await cq.answer("✅ У вас уже есть доступ — отправьте /start.", show_alert=True)
+            return
+        rec = user_store.requests[u.id]
+        kb = InlineKeyboardMarkup(inline_keyboard=[[
+            InlineKeyboardButton(text="✅ Пустить", callback_data=f"acc:ok:{u.id}"),
+            InlineKeyboardButton(text="❌ Отказать", callback_data=f"acc:no:{u.id}"),
+        ]])
+        delivered: list[tuple[int, int]] = []
+        for admin in sorted(cfg.admin_user_ids):
+            try:
+                msg = await bot.send_message(admin, access_request_text(u.id, rec), parse_mode="HTML", reply_markup=kb)
+                delivered.append((admin, msg.message_id))
+            except (TelegramBadRequest, TelegramForbiddenError) as e:
+                log.warning("Не удалось отправить заявку админу %s: %s", admin, e)
+        if not delivered:
+            user_store.cancel_request(u.id)
+            await cq.answer("Не получилось связаться с администратором. Попробуйте позже или напишите владельцу бота.",
+                            show_alert=True)
+            return
+        user_store.set_request_msgs(u.id, delivered)
+        log.info("Заявка на доступ от %s (%s) отправлена %d админам", u.id, users.display_name(rec), len(delivered))
+        await cq.answer("Заявка отправлена ✅")
+        if cq.message is not None:
+            try:
+                await cq.message.edit_reply_markup(reply_markup=None)
+            except (TelegramBadRequest, AttributeError):
+                pass
+            await bot.send_message(cq.message.chat.id, "📨 Заявка отправлена администратору. "
+                                                       "Я напишу, как только он ответит.")
+
+    @dp.callback_query(F.data.regexp(r"^acc:(ok|no):\d{1,16}$"))
+    async def on_access_decision(cq: CallbackQuery, bot: Bot) -> None:
+        if not cq.from_user or cq.from_user.id not in cfg.admin_user_ids:
+            log.warning("Попытка решить заявку не-админом: %s", cq.from_user.id if cq.from_user else None)
+            await cq.answer("⛔ Только администратор может принимать решения по заявкам.", show_alert=True)
+            return
+        _, action, raw = cq.data.split(":")
+        uid = users.parse_user_id(raw)
+        if uid is None:
+            await cq.answer("Некорректная заявка", show_alert=True)
+            return
+        who = admin_name(cq.from_user)
+        if action == "ok":
+            rec = user_store.approve(uid, by=cq.from_user.id)
+            if rec is None:
+                await cq.answer("Заявка уже обработана или устарела." + (" Доступ у пользователя есть."
+                                if uid_allowed(uid) else ""), show_alert=True)
+                return
+            sent_ok = await notify_user(bot, uid, ACCESS_GRANTED)
+            await close_request_msgs(bot, uid, rec, f"✅ Пустил: {who}" + ("" if sent_ok else
+                                     " (уведомить пользователя не удалось)"), extra=cq.message)
+            await cq.answer("Доступ открыт ✅" + ("" if user_store.persist_ok else " (только до перезапуска: DATA_DIR недоступен)"),
+                            show_alert=not user_store.persist_ok)
+        else:
+            rec = user_store.deny(uid, by=cq.from_user.id)
+            if rec is None:
+                await cq.answer("Заявка уже обработана или устарела.", show_alert=True)
+                return
+            await notify_user(bot, uid, "😔 К сожалению, администратор пока не открыл вам доступ. "
+                                        f"Повторить заявку можно через {fmt_wait(cfg.access_request_cooldown_sec)}."
+                              if cfg.access_request_cooldown_sec >= 60 else
+                              "😔 К сожалению, администратор пока не открыл вам доступ.")
+            await close_request_msgs(bot, uid, rec, f"❌ Отказал: {who}", extra=cq.message)
+            await cq.answer("Отказано")
+
     @dp.message(Command("img"))
     async def cmd_img(m: Message, command: CommandObject, bot: Bot) -> None:
         if not allowed(m):
-            await m.answer(NO_ACCESS)
+            await deny(m)
             return
         await handle_img(m, bot, command.args or "")
 
@@ -1559,7 +1867,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
     @dp.message(Command("carousel", "story"))
     async def cmd_insta(m: Message, command: CommandObject, bot: Bot) -> None:
         if not allowed(m):
-            await m.answer(NO_ACCESS)
+            await deny(m)
             return
         await handle_insta(m, bot, command.command.lower(), command.args or "")
 
@@ -1588,7 +1896,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
     @dp.message(Command("storyvideo"))
     async def cmd_storyvideo(m: Message, command: CommandObject, bot: Bot) -> None:
         if not allowed(m):
-            await m.answer(NO_ACCESS)
+            await deny(m)
             return
         n, prompt, _z, err = parse_args(command.args or "", "storyvideo")
         if err or not prompt:
@@ -1601,7 +1909,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
 
     @dp.callback_query(F.data.regexp(r"^(go|no|zip):[0-9a-f]+$"))
     async def on_callback(cq: CallbackQuery, bot: Bot) -> None:
-        if not cq.from_user or cq.from_user.id not in cfg.allowed_user_ids:
+        if not cq.from_user or not uid_allowed(cq.from_user.id):
             await cq.answer("Нет доступа", show_alert=True)
             return
         action, tok = cq.data.split(":", 1)
@@ -1838,7 +2146,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
     @dp.message(Command("meme", "meme5"))
     async def cmd_meme(m: Message, command: CommandObject, bot: Bot) -> None:
         if not allowed(m):
-            await m.answer(NO_ACCESS)
+            await deny(m)
             return
         await handle_meme(m, bot, command.command.lower(), command.args or "")
 
@@ -1884,7 +2192,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
     @dp.message(Command("memevideo"))
     async def cmd_memevideo(m: Message, command: CommandObject, bot: Bot) -> None:
         if not allowed(m):
-            await m.answer(NO_ACCESS)
+            await deny(m)
             return
         words = (command.args or "").split()
         seconds = max(1, min(15, cfg.video_duration))
@@ -1910,7 +2218,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
 
     @dp.callback_query(F.data.regexp(r"^ma:[0-9a-f]+:(\d{1,2}|r)$"))
     async def on_animal(cq: CallbackQuery, bot: Bot) -> None:
-        if not cq.from_user or cq.from_user.id not in cfg.allowed_user_ids:
+        if not cq.from_user or not uid_allowed(cq.from_user.id):
             await cq.answer("Нет доступа", show_alert=True)
             return
         _, tok, choice = cq.data.split(":")
@@ -1936,7 +2244,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
 
     @dp.callback_query(F.data.regexp(r"^mm:(more|cap|png):[0-9a-f]+$"))
     async def on_meme_button(cq: CallbackQuery, bot: Bot) -> None:
-        if not cq.from_user or cq.from_user.id not in cfg.allowed_user_ids:
+        if not cq.from_user or not uid_allowed(cq.from_user.id):
             await cq.answer("Нет доступа", show_alert=True)
             return
         _, action, jid = cq.data.split(":")
@@ -1977,7 +2285,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
 
     async def on_photo(m: Message, bot: Bot) -> None:
         if not allowed(m):
-            await m.answer(NO_ACCESS)
+            await deny(m)
             return
         if m.media_group_id:
             key = (m.chat.id, m.media_group_id)
@@ -2064,7 +2372,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
     @dp.message(Command("ref"))
     async def cmd_ref(m: Message, command: CommandObject, bot: Bot) -> None:
         if not allowed(m):
-            await m.answer(NO_ACCESS)
+            await deny(m)
             return
         arg = (command.args or "").strip().lower()
         uid = m.from_user.id
@@ -2084,14 +2392,14 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
     @dp.message(F.text & ~F.text.startswith("/"), F.chat.type == ChatType.PRIVATE)
     async def on_text(m: Message, bot: Bot) -> None:
         if not allowed(m):
-            await m.answer(NO_ACCESS)
+            await deny(m)
             return
         await answer_chat(m, bot, m.text, "auto" if cfg.search_mode == "auto" else None)
 
     @dp.message(Command("search"))
     async def cmd_search(m: Message, command: CommandObject, bot: Bot) -> None:
         if not allowed(m):
-            await m.answer(NO_ACCESS)
+            await deny(m)
             return
         q = (command.args or "").strip()
         if not q:
@@ -2154,7 +2462,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker) -> Di
     @dp.message(F.chat.type == ChatType.PRIVATE)
     async def on_other(m: Message) -> None:
         if not allowed(m):
-            await m.answer(NO_ACCESS)
+            await deny(m)
             return
         await m.answer("Я понимаю текст и фото (фото = референсы, см. /ref). Команды: /start, /img, /meme, /memevideo, "
                        "/carousel, /story, /storyvideo, /ref, /search, /new, /balance, /myid")
@@ -2173,7 +2481,7 @@ def describe(cfg: Config) -> str:
         else "локальный счётчик (стартовый остаток не задан — /setbalance)")
     return (f"chat={cfg.chat_model} image={cfg.image_model} base_url={cfg.base_url} "
             f"proxy={'да' if cfg.xai_proxy else 'нет'} allowed={len(cfg.allowed_user_ids)} "
-            f"admins={len(cfg.admin_user_ids)} balance={bal_src} data_dir={cfg.data_dir} "
+            f"admins={len(cfg.admin_user_ids)} access_requests={'on' if cfg.access_requests else 'off'} balance={bal_src} data_dir={cfg.data_dir} "
             f"warn={list(cfg.warn_thresholds)} video={cfg.video_model} {cfg.video_resolution} "
             f"brand={cfg.brand_name or '-'} meme_animals={len(memes.load_animals(cfg.meme_animals))} "
             f"search={cfg.search_mode}({cfg.search_tools}, src≤{cfg.search_max_sources}) "
@@ -2202,7 +2510,8 @@ async def main() -> int:
         return 0
 
     if not cfg.allowed_user_ids:
-        log.warning("ALLOWED_USER_IDS пуст — бот будет отвечать всем только на /start и /myid.")
+        log.warning("ALLOWED_USER_IDS и ADMIN_USER_IDS пусты — доступ только у добавленных ранее (users.json); "
+                    "заявки на доступ некому подтверждать.")
     shutil.rmtree(cfg.work_dir or os.path.join(tempfile.gettempdir(), "grok-bot-jobs"), ignore_errors=True)
     xai = XAIClient(cfg)
     tracker = BalanceTracker(cfg)

@@ -14,7 +14,7 @@ COPY . .
 RUN useradd --create-home --uid 10001 bot \
     && mkdir -p /app/data && chown -R bot:bot /app/data
 USER bot
-# Файл учёта баланса. Чтобы он переживал перезапуски — смонтируйте сюда постоянный том
+# Файлы данных (balance.json, users.json). Чтобы они переживали перезапуски — смонтируйте сюда постоянный том
 # (или укажите DATA_DIR = путь, куда хостинг монтирует volume).
 ENV DATA_DIR=/app/data
 
