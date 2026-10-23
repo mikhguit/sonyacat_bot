@@ -8,21 +8,29 @@ from dataclasses import dataclass
 
 from PIL import Image, ImageOps
 
-REF_MAX_SIDE = 1536     # храним не больше 1536 px по длинной стороне (RAM + размер запроса)
+REF_MAX_SIDE = 2048     # храним не больше 2048 px по длинной стороне (хватает на 1080×1920 без апскейла)
+EDIT_MAX_SIDE = 1536    # в /images/edits отправляем не больше 1536 px (размер запроса)
 VISION_MAX_SIDE = 768   # для описания стиля хватает
+OVERLAY_VISION_SIDE = 512  # overlay: Grok смотрит фото в detail=low — 512 px достаточно
 API_MAX_REFS = 5        # /v1/images/edits принимает до 5 исходных картинок
+OVERLAY_MAX_REFS = 10   # overlay: до 10 фото (= до 10 слайдов, лимит альбома Telegram)
+MAX_DECODE_PIXELS = 60_000_000  # не-JPEG крупнее ~60 Мп не декодируем (RAM 256 МБ)
 
-MODE_EDIT, MODE_STYLE, MODE_BG = "edit", "style", "bg"
+MODE_EDIT, MODE_STYLE, MODE_BG, MODE_OVERLAY = "edit", "style", "bg", "overlay"
+MODES = (MODE_EDIT, MODE_STYLE, MODE_BG, MODE_OVERLAY)
 MODE_WORDS = {
     "bg": MODE_BG, "фон": MODE_BG, "-bg": MODE_BG, "--bg": MODE_BG, "asis": MODE_BG,
     "style": MODE_STYLE, "стиль": MODE_STYLE, "-style": MODE_STYLE, "--style": MODE_STYLE,
     "edit": MODE_EDIT, "ref": MODE_EDIT, "реф": MODE_EDIT,
+    "overlay": MODE_OVERLAY, "-overlay": MODE_OVERLAY, "--overlay": MODE_OVERLAY, "наложение": MODE_OVERLAY,
+    "поверх": MODE_OVERLAY, "оверлей": MODE_OVERLAY,
 }
 NOREF_WORDS = {"noref", "безреф", "без-референса", "-noref", "--noref"}
 MODE_TITLES = {
     MODE_EDIT: "референсы → в генерацию картинок (стиль/персонаж/товар)",
     MODE_STYLE: "только стиль с референсов (описание Grok → в промпт)",
     MODE_BG: "фото как фон слайда (без генерации картинок)",
+    MODE_OVERLAY: "текст поверх ваших фото без изменений (1 фото = 1 слайд, без генерации)",
 }
 
 
@@ -45,6 +53,8 @@ def save_ref(data: bytes, path: str, max_side: int = REF_MAX_SIDE) -> tuple[int,
     im = Image.open(io.BytesIO(data))
     if im.format == "JPEG":
         im.draft("RGB", (max_side, max_side))  # декодирование сразу в уменьшенном масштабе — экономит RAM
+    elif im.width * im.height > MAX_DECODE_PIXELS:
+        raise ValueError(f"слишком большое изображение ({im.width}×{im.height})")
     im = ImageOps.exif_transpose(im)
     if im.mode in ("RGBA", "LA", "P"):
         im = im.convert("RGBA")
@@ -54,7 +64,7 @@ def save_ref(data: bytes, path: str, max_side: int = REF_MAX_SIDE) -> tuple[int,
     elif im.mode != "RGB":
         im = im.convert("RGB")
     im.thumbnail((max_side, max_side), Image.LANCZOS)
-    im.save(path, "JPEG", quality=90)
+    im.save(path, "JPEG", quality=95)  # overlay выводит фото как есть — храним почти без потерь
     size = im.size
     im.close()
     return size
@@ -66,6 +76,10 @@ def data_uri(path: str, max_side: int | None = None) -> str:
             raw = f.read()
     else:
         with Image.open(path) as im:
+            if max(im.size) <= max_side and im.format == "JPEG":
+                with open(path, "rb") as f:
+                    return "data:image/jpeg;base64," + base64.b64encode(f.read()).decode()
+            im.draft("RGB", (max_side, max_side))
             im = im.convert("RGB")
             im.thumbnail((max_side, max_side))
             buf = io.BytesIO()
@@ -132,11 +146,15 @@ def edit_prompt(base_prompt: str, n_refs: int, keep_subject: bool = True) -> str
 
 
 def contact_sheet(paths: list[str], cell: int = 360) -> bytes:
-    sheet = Image.new("RGB", (cell * len(paths) + 8 * (len(paths) + 1), cell + 16), (24, 24, 28))
+    cols = min(5, max(1, len(paths)))
+    rows = (len(paths) + cols - 1) // cols or 1
+    sheet = Image.new("RGB", (cell * cols + 8 * (cols + 1), cell * rows + 8 * (rows + 1)), (24, 24, 28))
     for i, p in enumerate(paths):
         with Image.open(p) as im:
+            im.draft("RGB", (cell, cell))
             im = ImageOps.fit(im.convert("RGB"), (cell, cell))
-            sheet.paste(im, (8 + i * (cell + 8), 8))
+            r, c = divmod(i, cols)
+            sheet.paste(im, (8 + c * (cell + 8), 8 + r * (cell + 8)))
     buf = io.BytesIO()
     sheet.save(buf, "JPEG", quality=85)
     return buf.getvalue()
@@ -145,4 +163,6 @@ def contact_sheet(paths: list[str], cell: int = 360) -> bytes:
 def list_refs(d: str) -> list[str]:
     if not os.path.isdir(d):
         return []
-    return sorted((os.path.join(d, f) for f in os.listdir(d) if f.endswith(".jpg")), key=os.path.getmtime)
+    # порядок загрузки: время записи, затем имя (ref_01…ref_10 / ref_<time_ns>)
+    return sorted((os.path.join(d, f) for f in os.listdir(d) if f.endswith(".jpg")),
+                  key=lambda p: (os.path.getmtime(p), os.path.basename(p)))

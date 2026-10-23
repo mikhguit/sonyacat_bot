@@ -134,13 +134,23 @@ _RULES = (
 )
 
 
+def topic_rule(topic: str) -> str:
+    """Тема должна жёстко управлять шуткой (кнопки тем и свободный текст /meme психология …)."""
+    if not topic:
+        return "Тема/ситуация: на твой выбор, жизненная ситуация.\n"
+    hint = topic_hint(topic)
+    return (f"ГЛАВНАЯ ТЕМА: «{topic}»{(' (' + hint + ')') if hint else ''}. Каждая шутка обязательно про эту тему — "
+            "узнаваемая ситуация именно из этой сферы, понятная тем, кто в ней живёт; не уходи в общие шутки "
+            "про понедельник, если тема о другом.\n")
+
+
 def meme_messages(animal: Animal, topic: str, n: int, story: bool, video: bool = False,
                   photo_note: str = "") -> list[dict]:
     system = "Ты — автор вирусных русскоязычных мемов для Instagram и Telegram. Отвечай только JSON по схеме."
     user = (
         f"Сделай {n} {'разных мемов' if n > 1 else 'мем'} с животным: {animal.name.split(' ', 1)[-1]} "
         f"({animal.prompt}). Мемный образ: {animal.vibe or 'милый и смешной'}.\n"
-        f"Тема/ситуация: {topic or 'на твой выбор, жизненная ситуация'}.\n{_RULES}\n"
+        f"{topic_rule(topic)}{_RULES}\n"
         f"scene — что делает животное и где (на английском, 1–2 предложения, смешная поза/выражение, "
         f"{'вертикальный кадр' if story else 'квадратный кадр'}), без надписей.\n"
         + ("Это сценарий для короткого видео 5–10 секунд: в scene опиши действие в динамике и камеру; "
@@ -149,6 +159,87 @@ def meme_messages(animal: Animal, topic: str, n: int, story: bool, video: bool =
         + 'Формат: {"memes":[{"top":"...","bottom":"...","scene":"..."}]}'
     )
     return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+
+def overlay_meme_messages(topic: str, n: int, story: bool, images: list[str] | None = None,
+                          detail: str = "low") -> list[dict]:
+    """Мем поверх фото пользователя: мем i — к фото i. Фото не меняется, Grok только пишет подпись."""
+    system = "Ты — автор вирусных русскоязычных мемов для Instagram и Telegram. Отвечай только JSON по схеме."
+    if images:
+        about = (f"Ниже {len(images)} фото пользователя (Фото 1…). Мем i — подпись к фото i: обыграй то, что "
+                 "реально видно на фото (позу, выражение, предметы, обстановку). В scene кратко опиши фото i "
+                 "по-английски (1 предложение).")
+    else:
+        about = ("Подписи лягут на фото пользователя, но фото ты не видишь — пиши универсально по теме; "
+                 "в scene пиши «user photo».")
+    user = (f"Сделай {n} {'разных мемов' if n > 1 else 'мем'} — подписи к фото пользователя "
+            f"({'вертикальный кадр' if story else 'квадратный кадр'}).\n{topic_rule(topic)}{_RULES}\n{about}\n"
+            'Формат: {"memes":[{"top":"...","bottom":"...","scene":"..."}]}')
+    content: list[dict] = [{"type": "input_text", "text": user}]
+    for i, uri in enumerate(images or []):
+        content.append({"type": "input_text", "text": f"Фото {i + 1}:"})
+        content.append({"type": "input_image", "image_url": uri, "detail": detail})
+    return [{"role": "system", "content": system}, {"role": "user", "content": content if images else user}]
+
+
+# ---------------------------------------------------------------------------
+# Темы мемов (кнопки мастера)
+# ---------------------------------------------------------------------------
+@dataclass(frozen=True)
+class Topic:
+    title: str   # для кнопки, с эмодзи
+    name: str    # что уходит в промпт
+    hint: str = ""
+
+
+DEFAULT_TOPICS: tuple[Topic, ...] = (
+    Topic("🧠 Психология", "психология", "тревожность, самокопание, терапия, границы, выгорание, прокрастинация"),
+    Topic("💼 Работа/офис", "работа и офис", "созвоны, дедлайны, начальник, коллеги, отпуск, «можно было письмом»"),
+    Topic("💰 Деньги", "деньги", "зарплата, траты, кешбэк, накопления, «до зарплаты 3 дня»"),
+    Topic("❤️ Отношения", "отношения", "свидания, переписки, ссоры из-за ерунды, «ты меня любишь?»"),
+    Topic("📱 Соцсети", "соцсети", "сторис, лайки, рилсы, думскроллинг, экранное время"),
+    Topic("🏋️ Спорт/ЗОЖ", "спорт и ЗОЖ", "зал с понедельника, диета, шаги, протеин, «завтра начну»"),
+)
+
+
+_TOPIC_HINTS: dict[str, str] = {}  # подсказки тем из MEME_TOPICS (заполняет load_topics)
+
+
+def topic_hint(topic: str) -> str:
+    t = (topic or "").strip().lower()
+    if t in _TOPIC_HINTS:
+        return _TOPIC_HINTS[t]
+    for tp in DEFAULT_TOPICS:
+        if t == tp.name.lower() or t == tp.title.split(" ", 1)[-1].lower():
+            return tp.hint
+    return ""
+
+
+def load_topics(spec: str = "") -> list[Topic]:
+    """MEME_TOPICS: пусто — темы по умолчанию; иначе через «;» (или «,», если «;» нет): «🧠 Психология», «🐶 Собачники: жизнь с собакой»."""
+    if not spec.strip():
+        return list(DEFAULT_TOPICS)
+    by_title = {tp.title.split(" ", 1)[-1].lower(): tp for tp in DEFAULT_TOPICS}
+    out: list[Topic] = []
+    sep = r"[;\n]" if re.search(r"[;\n]", spec) else ","
+    for part in re.split(sep, spec):
+        part = part.strip()
+        if not part:
+            continue
+        title, _, hint = (x.strip() for x in part.partition(":"))
+        if not title:
+            continue
+        plain = re.sub(r"^[^\w«]+", "", title).strip() or title
+        known = by_title.get(plain.lower())
+        if known and not hint:
+            out.append(Topic(known.title if plain == title else title, known.name, known.hint))
+        else:
+            out.append(Topic(title[:40], plain.lower()[:60], hint[:200]))
+    out = out[:12] or list(DEFAULT_TOPICS)
+    for tp in out:
+        if tp.hint:
+            _TOPIC_HINTS[tp.name.lower()] = tp.hint
+    return out
 
 
 def photo_animal(subject: str = "") -> Animal:
@@ -161,7 +252,7 @@ def recaption_messages(animal: Animal, topic: str, scene: str, previous: list[st
     system = "Ты — автор вирусных русскоязычных мемов. Отвечай только JSON по схеме."
     prev = "\n".join(f"- {p}" for p in previous[-6:]) or "—"
     user = (
-        f"Картинка уже есть: {scene} (животное: {animal.prompt}). Тема: {topic or 'любая жизненная'}.\n"
+        f"Картинка уже есть: {scene} (герой: {animal.prompt}).\n{topic_rule(topic)}"
         f"Придумай ДРУГУЮ подпись к этой же картинке, не похожую на прошлые:\n{prev}\n{_RULES}\n"
         'scene верни ту же. Формат: {"memes":[{"top":"...","bottom":"...","scene":"..."}]}'
     )

@@ -434,3 +434,216 @@ def contact_sheet(paths: list[str], cols: int, thumb_w: int, out_path: str, gap:
         sheet.paste(im, (gap + c * (thumb_w + gap), gap + r * (th + gap)))
         im.close()
     sheet.save(out_path, quality=90)
+
+
+# ---------------------------------------------------------------------------
+# Overlay: текст поверх фото пользователя (фото не перерисовывается)
+# ---------------------------------------------------------------------------
+OVERLAY_POSITIONS = ("bottom", "top", "center", "auto")
+OVERLAY_STYLES = ("gradient", "plate")
+
+
+def overlay_schema() -> dict:
+    slide = {
+        "type": "object",
+        "properties": {
+            "photo": {"type": "string", "description": "Что на этом фото, 3–8 слов (для сверки)"},
+            "title": {"type": "string", "description": "Заголовок слайда, до 6 слов"},
+            "text": {"type": "string", "description": "Короткий текст, до 20 слов (может быть пустым)"},
+        },
+        "required": ["photo", "title", "text"],
+        "additionalProperties": False,
+    }
+    return {
+        "type": "object",
+        "properties": {
+            "slides": {"type": "array", "items": slide},
+            "caption": {"type": "string"},
+            "hashtags": {"type": "array", "items": {"type": "string"}},
+        },
+        "required": ["slides", "caption", "hashtags"],
+        "additionalProperties": False,
+    }
+
+
+def overlay_messages(kind: str, topic: str, n: int, images: list[str] | None = None, brand_name: str = "",
+                     brand_style: str = "", detail: str = "low") -> list[dict]:
+    """Один запрос: тексты для n слайдов, слайд i — к фото i. images — data URI (или None, если vision выключен)."""
+    what = "слайдов Instagram-карусели" if kind == "carousel" else "кадров Instagram Stories (9:16)"
+    if n == 1:
+        structure = "Один слайд: хук + суть + призыв."
+    else:
+        structure = (f"Слайд 1 — цепляющий хук, далее по одной мысли на слайд, слайд {n} — призыв к действию "
+                     "(сохранить, подписаться, написать).")
+    brand = f" Бренд/аккаунт: {brand_name} — упомяни его в призыве к действию." if brand_name else ""
+    if brand_style:
+        brand += f" Тон бренда: {brand_style}."
+    if images:
+        photo_rule = ("Ниже фото пользователя по порядку (Фото 1…Фото N). Текст слайда i пишется поверх фото i — "
+                      "он должен соответствовать тому, что на этом фото, и теме. В поле photo кратко опиши фото i.")
+    else:
+        photo_rule = ("Тексты лягут поверх фото пользователя (по одному на слайд), но фото ты не видишь — "
+                      "пиши по теме, нейтрально к содержимому кадра; в поле photo пиши «—».")
+    system = ("Ты — SMM-копирайтер. Пишешь живо, конкретно, без воды, по-русски. Текст накладывается поверх "
+              "фотографии, поэтому он короткий. Никаких эмодзи в title и text. Отвечай только JSON по схеме.")
+    user = (
+        f"Тема: {topic or 'не задана — придумай её по содержимому фото'}\n\n"
+        f"Ровно {n} {what}. {structure} Заголовок — до 6 слов, текст — до 20 слов.{brand}\n\n"
+        f"{photo_rule}\n\n"
+        "caption — подпись к посту по-русски (до 1200 символов, можно эмодзи, в конце вопрос к аудитории). "
+        "hashtags — 10–15 релевантных хэштегов с #.\n"
+        'Формат: {"slides":[{"photo":"...","title":"...","text":"..."}],"caption":"...","hashtags":["#..."]}'
+    )
+    content: list[dict] = [{"type": "input_text", "text": user}]
+    for i, uri in enumerate(images or []):
+        content.append({"type": "input_text", "text": f"Фото {i + 1}:"})
+        content.append({"type": "input_image", "image_url": uri, "detail": detail})
+    return [{"role": "system", "content": system}, {"role": "user", "content": content if images else user}]
+
+
+def open_photo(path: str, size: tuple[int, int]) -> Image.Image:
+    """Открыть фото с учётом EXIF-поворота, JPEG декодируется сразу в нужном масштабе (RAM)."""
+    from PIL import ImageOps
+    im = Image.open(path)
+    if im.format == "JPEG":
+        im.draft("RGB", (size[0], size[1]))  # draft не уменьшит ниже запрошенного
+    out = ImageOps.exif_transpose(im)
+    if out is not im:
+        im.close()
+    if out.mode != "RGB":
+        rgb = out.convert("RGB")
+        out.close()
+        out = rgb
+    return out
+
+
+def _busy_score(img: Image.Image, box: tuple[int, int, int, int]) -> float:
+    """Насколько «занята» зона (средняя яркость границ) — для OVERLAY_TEXT_POS=auto."""
+    from PIL import ImageStat
+    reg = img.crop(box).convert("L")
+    reg.thumbnail((270, 270))
+    return ImageStat.Stat(reg.filter(ImageFilter.FIND_EDGES)).mean[0]
+
+
+def render_overlay(photo: Image.Image, slide: Slide, idx: int, total: int, kind: str, brand_name: str = "",
+                   accent: tuple[int, int, int] = (255, 213, 74), pos: str = "bottom",
+                   style: str = "gradient") -> Image.Image:
+    """Фото → cover-crop до 1080×1080 / 1080×1920, затемнение ТОЛЬКО под текстом, текст, счётчик, бренд.
+    Пиксели вне LAST_LAYOUT['touched'] совпадают с fit_cover(photo)."""
+    size = CAROUSEL_SIZE if kind == "carousel" else STORY_SIZE
+    W, H = size
+    img = fit_cover(photo, size)
+    is_first, is_last = idx == 0, idx == total - 1 and total > 1
+    if kind == "carousel":
+        margin, area_top, area_bottom = 70, 140, H - 120
+    else:
+        margin, area_top, area_bottom = 80, STORY_SAFE_TOP + 100, H - STORY_SAFE_BOTTOM - 30
+    if pos not in OVERLAY_POSITIONS:
+        pos = "bottom"
+    if pos == "auto":
+        band = (area_bottom - area_top) // 3
+        top_s = _busy_score(img, (0, area_top, W, area_top + band))
+        bot_s = _busy_score(img, (0, area_bottom - band, W, area_bottom))
+        pos = "top" if top_s < bot_s * 0.8 else "bottom"
+    style = style if style in OVERLAY_STYLES else "gradient"
+    pad = 36 if style == "plate" else 0
+    max_w = W - 2 * margin - 2 * pad
+    avail = (area_bottom - area_top) // (2 if kind == "carousel" else 3) + (60 if kind == "carousel" else 120)
+    title = fit_block(slide.title, FONT_TITLE, max_w, int(avail * 0.6), 80 if is_first else 64, 38, 1.12)
+    body = fit_block(slide.text, FONT_BODY, max_w, max(60, avail - title.height - 60),
+                     42 if kind == "carousel" else 46, 28, 1.3)
+    extra = []
+    if is_last and brand_name:
+        extra.append((brand_name, _font(FONT_TITLE, 44 if kind == "carousel" else 52), accent))
+    gap = 22 if body.lines else 0
+    bar_h, bar_gap = 10, 24
+    extra_h = sum(int(f.size * 1.4) for _, f, _ in extra) + (20 if extra else 0)
+    block_h = bar_h + bar_gap + title.height + gap + body.height + extra_h
+    if pos == "top":
+        y0 = area_top + pad
+    elif pos == "center":
+        y0 = (H - block_h) // 2
+    else:
+        y0 = area_bottom - block_h - pad
+    y0 = max(area_top + pad, y0)
+    text_box = (margin, y0, W - margin, y0 + block_h)
+    touched: list[tuple[int, int, int, int]] = []
+
+    if style == "plate":
+        box = (margin, y0 - pad, W - margin, y0 + block_h + pad)
+        ImageDraw.Draw(img, "RGBA").rounded_rectangle(box, radius=32, fill=(10, 10, 14, 165))
+        touched.append(box)
+    else:
+        # полоса затемнения: плавный вход (fade) → плато под текстом; вне полосы фото не трогаем
+        fade, mx = (130 if kind == "carousel" else 180), 175
+        t0, t1 = y0 - 40, y0 + block_h + 40
+        if pos == "bottom":
+            b0, b1 = max(0, t0 - fade), H
+        elif pos == "top":
+            b0, b1 = 0, min(H, t1 + fade)
+        else:
+            b0, b1 = max(0, t0 - fade), min(H, t1 + fade)
+        col = Image.new("L", (1, b1 - b0), 0)
+        for y in range(b0, b1):
+            if y < t0 and pos != "top":
+                a = mx * ((y - b0) / max(1, t0 - b0)) ** 1.6
+            elif y > t1 and pos != "bottom":
+                a = mx * ((b1 - y) / max(1, b1 - t1)) ** 1.6
+            else:
+                a = mx
+            col.putpixel((0, y - b0), int(a))
+        mask = col.resize((W, b1 - b0))
+        region = img.crop((0, b0, W, b1))
+        dark = Image.new("RGB", region.size, (0, 0, 0))
+        img.paste(Image.composite(dark, region, mask), (0, b0))
+        for x in (mask, region, dark, col):
+            x.close()
+        touched.append((0, b0, W, b1))
+
+    d = ImageDraw.Draw(img, "RGBA")
+    shadow = (0, 0, 0, 110)
+    x, y = margin + pad, y0
+    d.rounded_rectangle((x, y, x + 110, y + bar_h), radius=5, fill=accent)
+    y += bar_h + bar_gap
+    for line in title.lines:
+        d.text((x + 2, y + 3), line, font=title.font, fill=shadow)
+        d.text((x, y), line, font=title.font, fill=(255, 255, 255))
+        y += title.line_h
+    y += gap
+    for line in body.lines:
+        d.text((x + 2, y + 2), line, font=body.font, fill=shadow)
+        d.text((x, y), line, font=body.font, fill=(236, 236, 240))
+        y += body.line_h
+    if extra:
+        y += 20
+        for t, f, colr in extra:
+            d.text((x, y), t, font=f, fill=colr)
+            y += int(f.size * 1.4)
+    touched.append(text_box)
+
+    def pill(right: int, top: int, text: str, font, fg=(255, 255, 255), bg=(0, 0, 0, 150), padx=(22, 12)):
+        tw = int(font.getlength(text))
+        asc, desc = font.getmetrics()
+        th = asc + desc
+        box = (right - tw - 2 * padx[0], top, right, top + th + 2 * padx[1])
+        d.rounded_rectangle(box, radius=(th + 2 * padx[1]) // 2, fill=bg)
+        d.text((box[0] + padx[0], top + padx[1]), text, font=font, fill=fg)
+        touched.append(box)
+
+    cnt_y = 50 if kind == "carousel" else STORY_SAFE_TOP + 20
+    if total > 1:
+        pill(W - margin, cnt_y, f"{idx + 1}/{total}", _font(FONT_SEMI, 32 if kind == "carousel" else 36))
+    if kind == "carousel" and is_first and total > 1:
+        f = _font(FONT_SEMI, 30)
+        fy = H - 92 if pos != "bottom" or style == "plate" else H - 80
+        pill(W - margin, fy, "Листайте  →", f, fg=(20, 20, 20), bg=accent + (235,))
+    if brand_name and not is_last:
+        f = _font(FONT_SEMI, 28 if kind == "carousel" else 32)
+        tw = int(f.getlength(brand_name))
+        by = 50 if kind == "carousel" else STORY_SAFE_TOP + 20
+        pill(margin + tw + 44, by, brand_name, f)
+    LAST_LAYOUT.clear()
+    LAST_LAYOUT.update(mode="overlay", pos=pos, style=style, text_box=text_box, touched=touched,
+                       title_size=title.font.size, body_size=body.font.size,
+                       lines=len(title.lines) + len(body.lines))
+    return img

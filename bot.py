@@ -33,10 +33,14 @@ import httpx
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ChatAction, ChatType
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramUnauthorizedError
-from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.filters import Command, CommandObject, CommandStart, StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.types import LinkPreviewOptions
 from aiogram.types import (BufferedInputFile, CallbackQuery, FSInputFile, InlineKeyboardButton,
-                           InlineKeyboardMarkup, InputMediaPhoto, Message)
+                           InlineKeyboardMarkup, InputMediaPhoto, KeyboardButton, Message,
+                           ReplyKeyboardMarkup, ReplyKeyboardRemove)
 from aiogram.utils.chat_action import ChatActionSender
 from aiogram.utils.token import TokenValidationError
 from PIL import Image
@@ -187,10 +191,14 @@ class Config:
     # мемы
     meme_animals: str = ""
     meme_image_resolution: str = "1k"
+    meme_topics: str = ""
     # референсы
     price_image_input: float = DEFAULT_PRICE_IMAGE_INPUT
     ref_max: int = 4
-    ref_mode: str = "edit"          # режим по умолчанию, если есть референсы: edit | style | bg
+    ref_mode: str = "edit"          # режим по умолчанию, если есть референсы: edit | style | bg | overlay
+    ref_overlay_max: int = 10       # overlay: сколько фото (= слайдов) максимум
+    overlay_text_pos: str = "bottom"  # bottom | top | center | auto
+    overlay_style: str = "gradient"   # gradient | plate
     ref_edit_quality: str = "low"   # quality для /v1/images/edits: low | medium | auto
     ref_vision: bool = True         # описывать стиль референсов через Grok vision
     ref_ttl_sec: float = 3600.0
@@ -203,6 +211,11 @@ class Config:
     # доступ: заявки от новых пользователей
     access_requests: bool = True
     access_request_cooldown_sec: float = 3600.0
+
+    @property
+    def ref_store_max(self) -> int:
+        """Сколько фото хранить в /ref: edit/style/bg берут последние REF_MAX, overlay — до REF_OVERLAY_MAX."""
+        return max(self.ref_max, self.ref_overlay_max)
 
     def image_price(self, resolution: str | None, quality: str = "low") -> float:
         p = self.price_image + PRICE_IMAGE_RES_ADD.get((resolution or "1k").lower(), 0.0)
@@ -266,9 +279,13 @@ class Config:
             work_dir=_env("WORK_DIR"),
             meme_animals=_env("MEME_ANIMALS"),
             meme_image_resolution=_env("MEME_IMAGE_RESOLUTION") or "1k",
+            meme_topics=_env("MEME_TOPICS"),
             price_image_input=_float("PRICE_IMAGE_INPUT", DEFAULT_PRICE_IMAGE_INPUT),
             ref_max=max(1, min(refs.API_MAX_REFS, int(_float("REF_MAX", 4)))),
-            ref_mode=(_env("REF_MODE") or "edit").lower() if (_env("REF_MODE") or "edit").lower() in ("edit", "style", "bg") else "edit",
+            ref_mode=(_env("REF_MODE") or "edit").lower() if (_env("REF_MODE") or "edit").lower() in refs.MODES else "edit",
+            ref_overlay_max=max(1, min(refs.OVERLAY_MAX_REFS, int(_float("REF_OVERLAY_MAX", 10)))),
+            overlay_text_pos=(_env("OVERLAY_TEXT_POS") or "bottom").lower() if (_env("OVERLAY_TEXT_POS") or "bottom").lower() in insta.OVERLAY_POSITIONS else "bottom",
+            overlay_style=(_env("OVERLAY_STYLE") or "gradient").lower() if (_env("OVERLAY_STYLE") or "gradient").lower() in insta.OVERLAY_STYLES else "gradient",
             ref_edit_quality=(_env("REF_EDIT_QUALITY") or "low").lower(),
             ref_vision=_env("REF_VISION").lower() not in ("0", "false", "no", "off", "нет"),
             search_mode="off" if (_env("SEARCH_MODE") or "auto").lower() in ("off", "0", "false", "no", "нет") else "auto",
@@ -749,7 +766,7 @@ class XAIClient:
     async def image_edit(self, prompt: str, ref_paths: list[str], aspect_ratio: str | None = None,
                          resolution: str | None = None, quality: str | None = None) -> tuple[bytes, str, Cost]:
         """POST /v1/images/edits: 1 картинка — поле image, 2–5 — массив images (base64 data URI)."""
-        srcs = [{"type": "image_url", "url": refs.data_uri(p)} for p in ref_paths[:refs.API_MAX_REFS]]
+        srcs = [{"type": "image_url", "url": refs.data_uri(p, refs.EDIT_MAX_SIDE)} for p in ref_paths[:refs.API_MAX_REFS]]
         payload = {"model": self.cfg.image_model, "prompt": prompt, "n": 1, "response_format": "b64_json"}
         if len(srcs) == 1:
             payload["image"] = srcs[0]
@@ -843,6 +860,8 @@ class XAIClient:
 # ---------------------------------------------------------------------------
 HELP = (
     "Привет! Я бот-посредник к Grok (xAI).\n\n"
+    "⬇️ Проще всего — кнопками меню внизу: Чат, Поиск, Картинка, Карусель, Сторис, Видео, Мем, Референсы, Баланс. "
+    "Бот сам спросит тему, количество и режим; «✖️ Отмена» или /cancel — выйти из мастера.\n\n"
     "Команды:\n"
     "/start — это сообщение\n"
     "/myid — узнать свой Telegram ID (нужен владельцу для доступа)\n"
@@ -854,12 +873,15 @@ HELP = (
     "/story <тема> [N] — сторис 9:16 (N кадров 1–10, по умолчанию 3)\n"
     "/storyvideo [сек] <описание> — короткое вертикальное видео (1–15 сек)\n"
     "Добавьте слово zip к /carousel или /story — пришлю PNG без сжатия архивом.\n"
-    "/meme [зверь] [тема] — мем с милым животным (без зверя — покажу кнопки); "
+    "/meme [зверь] [тема] — мем с милым животным (без зверя — покажу кнопки), тема управляет шуткой: "
+    "/meme психология; /meme overlay [тема] — подпись на ваше фото; "
     "story — формат 9:16, число 1–5 — несколько мемов, /meme5 — сразу 5\n"
     "/memevideo [сек] <зверь> <ситуация> — короткое мем-видео 9:16\n"
     "📎 Референсы: пришлите фото (или альбом) с подписью /carousel …, /story …, /meme … или ответьте командой на фото; "
     "просто фото без подписи сохраняются как референсы (/ref — посмотреть, /ref clear — удалить). "
-    "Флаги: bg — фото как фон без генерации, style — только стиль, noref — без референсов.\n\n"
+    "Флаги: overlay — текст поверх ваших фото без изменений (1 фото = 1 слайд, до 10), "
+    "bg — фото как фон без генерации, style — только стиль, noref — без референсов. "
+    "/ref mode overlay — сделать режим по умолчанию.\n\n"
     "Просто напишите сообщение — и Grok ответит. Я помню последние ~10 реплик диалога. "
     "Если нужен свежий факт, Grok сам поищет в интернете и X и покажет источники.\n"
     "После каждого ответа показываю его стоимость и остаток баланса."
@@ -875,7 +897,10 @@ REF_HELP = (
     "• по умолчанию — фото передаются в генерацию картинок (стиль, персонаж, товар)\n"
     "• style — только описание стиля с фото (дешевле)\n"
     "• bg — само фото становится фоном слайда/мема, без генерации (платится только текст)\n"
+    "• overlay — текст поверх ВАШИХ фото без перерисовки: сколько фото (до {o}), столько слайдов/кадров, "
+    "в порядке загрузки. Платится только текст. Пример: /carousel overlay отпуск в Грузии\n"
     "• noref — не использовать сохранённые референсы\n\n"
+    "/ref mode overlay|edit|style|bg|default — режим по умолчанию для ваших фото\n"
     "/ref clear — удалить сохранённые фото."
 )
 ADMIN_HELP = (
@@ -886,6 +911,29 @@ ADMIN_HELP = (
     "/users — кто имеет доступ и ожидающие заявки\n"
     "Заявки на доступ приходят сюда с кнопками «✅ Пустить» / «❌ Отказать»."
 )
+MENU_CHAT, MENU_SEARCH, MENU_IMG = "💬 Чат", "🔎 Поиск", "🎨 Картинка"
+MENU_CAROUSEL, MENU_STORY, MENU_VIDEO = "🖼 Карусель", "📱 Сторис", "🎬 Видео"
+MENU_MEME, MENU_REFS, MENU_BALANCE = "🐱 Мем", "📎 Референсы", "💰 Баланс"
+MENU_USERS = "👥 Пользователи"
+MENU_ROWS = ((MENU_CHAT, MENU_SEARCH, MENU_IMG), (MENU_CAROUSEL, MENU_STORY, MENU_VIDEO),
+             (MENU_MEME, MENU_REFS, MENU_BALANCE))
+MENU_ALL = frozenset([b for r in MENU_ROWS for b in r] + [MENU_USERS])
+WIZ_CANCEL = "✖️ Отмена"
+
+
+class Wiz(StatesGroup):
+    text = State()    # ждём текст (тема, описание, запрос)
+    choose = State()  # ждём нажатия инлайн-кнопки
+
+
+def main_menu(admin: bool = False) -> ReplyKeyboardMarkup:
+    rows = [[KeyboardButton(text=t) for t in r] for r in MENU_ROWS]
+    if admin:
+        rows.append([KeyboardButton(text=MENU_USERS)])
+    return ReplyKeyboardMarkup(keyboard=rows, resize_keyboard=True, is_persistent=True,
+                               input_field_placeholder="Напишите сообщение или выберите кнопку")
+
+
 NO_ACCESS = "⛔ У вас нет доступа к этому боту — он работает по приглашению."
 STRANGER_HELLO = "Привет! Это частный бот-посредник к Grok (xAI)."
 ACCESS_BUTTON = "🙋 Запросить доступ"
@@ -993,7 +1041,7 @@ def source_text(info: BalanceInfo, tracker: BalanceTracker) -> str:
 # ---------------------------------------------------------------------------
 def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                      user_store: users.UserStore | None = None) -> Dispatcher:
-    dp = Dispatcher()
+    dp = Dispatcher(storage=MemoryStorage())
     history: dict[int, deque] = defaultdict(lambda: deque(maxlen=HISTORY_TURNS * 2))
     locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
     if user_store is None:
@@ -1055,7 +1103,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             text, kb = access_text_and_kb(m.from_user.id if m.from_user else None)
             await m.answer(STRANGER_HELLO + "\n\n" + text, reply_markup=kb)
             return
-        await m.answer(HELP + (ADMIN_HELP if is_admin(m) else ""))
+        await m.answer(HELP + (ADMIN_HELP if is_admin(m) else ""), reply_markup=main_menu(is_admin(m)))
 
     @dp.message(Command("myid"))
     async def cmd_myid(m: Message) -> None:
@@ -1429,6 +1477,11 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             return []
         return paths
 
+    ref_user_mode: dict[int, str] = {}  # /ref mode … — режим по умолчанию для фото конкретного пользователя
+
+    def default_mode(uid: int | None) -> str:
+        return ref_user_mode.get(uid or 0) or cfg.ref_mode
+
     def new_tmp_dir() -> str:
         d = os.path.join(work_root, "t" + secrets.token_hex(5))
         os.makedirs(d, exist_ok=True)
@@ -1436,13 +1489,13 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         return d
 
     def photo_file(msg: Message | None) -> tuple[str, int] | None:
-        """(file_id, размер) самой крупной версии фото до ~1600 px или картинки-документа."""
+        """(file_id, размер) самой крупной версии фото до ~2560 px (для overlay важна чёткость) или документа."""
         if msg is None:
             return None
         if msg.photo:
             best = msg.photo[0]
             for ps in msg.photo:  # Telegram отдаёт размеры по возрастанию
-                if max(ps.width, ps.height) <= 1600 or ps is msg.photo[0]:
+                if max(ps.width, ps.height) <= 2560 or ps is msg.photo[0]:
                     best = ps
             return best.file_id, best.file_size or 0
         d = msg.document
@@ -1605,7 +1658,20 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         except TelegramBadRequest:
             pass
 
-    def parse_args(raw: str, kind: str) -> tuple[int | None, str, bool, str | None]:
+    def parse_overlay_opts(raw: str) -> tuple[str, dict]:
+        """pos=top|bottom|center|auto, style=gradient|plate — разовые настройки overlay."""
+        opts, rest = {}, []
+        for w in (raw or "").split():
+            k, _, v = w.lower().partition("=")
+            if k in ("pos", "текст") and v in insta.OVERLAY_POSITIONS:
+                opts["overlay_pos"] = v
+            elif k in ("style", "стиль") and v in insta.OVERLAY_STYLES:
+                opts["overlay_style"] = v
+            else:
+                rest.append(w)
+        return " ".join(rest), opts
+
+    def parse_args(raw: str, kind: str, min_n: int | None = None) -> tuple[int | None, str, bool, str | None]:
         """-> (N, тема, zip?, ошибка)."""
         words = (raw or "").split()
         as_zip = False
@@ -1622,6 +1688,8 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             lo, hi = insta.CAROUSEL_MIN, insta.CAROUSEL_MAX
         else:
             lo, hi = insta.STORY_MIN, insta.STORY_MAX
+        if min_n is not None:
+            lo = min_n
         if rest and re.fullmatch(r"\d{1,2}", rest[0]):
             n = int(rest.pop(0))
         elif kind == "story" and rest and re.fullmatch(r"\d{1,2}", rest[-1]):
@@ -1677,7 +1745,11 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             release_memory()
 
     async def run_insta(bot: Bot, chat_id: int, kind: str, topic: str, n: int, as_zip: bool,
-                        ref_paths: list[str] | tuple = (), ref_mode: str | None = None, ref_source: str = "") -> None:
+                        ref_paths: list[str] | tuple = (), ref_mode: str | None = None, ref_source: str = "",
+                        overlay_pos: str | None = None, overlay_style: str | None = None) -> None:
+        if ref_mode == refs.MODE_OVERLAY:
+            await run_overlay(bot, chat_id, kind, topic, n, as_zip, ref_paths, ref_source, overlay_pos, overlay_style)
+            return
         spend = Spend(bot)
         word = "слайд" if kind == "carousel" else "кадр"
         rc = {"paths": [p for p in ref_paths if os.path.exists(p)], "mode": ref_mode}
@@ -1779,6 +1851,95 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                 except OSError:
                     pass
 
+    def overlay_estimate(k: int) -> float:
+        return cfg.est_chat_usd + (0.001 * k if cfg.ref_vision else 0.0)
+
+    async def run_overlay(bot: Bot, chat_id: int, kind: str, topic: str, n: int, as_zip: bool,
+                          ref_paths: list[str] | tuple, ref_source: str = "", pos: str | None = None,
+                          style: str | None = None) -> None:
+        """Overlay: фото пользователя без перерисовки + текст. Один запрос к Grok (тексты + vision), без генерации картинок."""
+        spend = Spend(bot)
+        word = "слайд" if kind == "carousel" else "кадр"
+        paths = [p for p in ref_paths if os.path.exists(p)][:cfg.ref_overlay_max]
+        if not paths:
+            await bot.send_message(chat_id, "📎 Фото не найдены (хранятся ограниченное время). Пришлите их заново.")
+            return
+        n = max(1, min(n or len(paths), len(paths)))
+        paths = paths[:n]
+        pos, style = pos or cfg.overlay_text_pos, style or cfg.overlay_style
+        status = await bot.send_message(
+            chat_id, ref_line(n, refs.MODE_OVERLAY, ref_source) + f"\n✍️ Пишу тексты к {n} фото… "
+                     f"(оценка ≈{fmt_cost(overlay_estimate(n))}, картинки не генерируются)")
+        try:
+            images = None
+            if cfg.ref_vision:
+                images = await asyncio.to_thread(lambda: [refs.data_uri(p, refs.OVERLAY_VISION_SIDE) for p in paths])
+            async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
+                data, cost = await xai.chat_json(
+                    insta.overlay_messages(kind, topic, n, images, cfg.brand_name, cfg.brand_style),
+                    insta.overlay_schema(), name="overlay")
+            del images
+            await spend.add(cost)
+        except XAIError as e:
+            log.error("%s overlay plan error: %s", kind, e)
+            await spend.add(e.cost)
+            await status_edit(status, error_text(e) + ("\n\n" + spend.line() if spend.usd else ""))
+            return
+        plan = insta.normalize_plan(data, kind, n, topic or "Мои фото")
+        jid = secrets.token_hex(5)
+        jdir = os.path.join(work_root, jid)
+        os.makedirs(jdir, exist_ok=True)
+        size = insta.CAROUSEL_SIZE if kind == "carousel" else insta.STORY_SIZE
+        pngs, jpgs = [], []
+        try:
+            for i, slide in enumerate(plan.slides):
+                await status_edit(status, f"🖼 Накладываю текст: {word} {i + 1}/{n}…")
+
+                def render_one(i=i, slide=slide) -> tuple[str, str]:
+                    photo = insta.open_photo(paths[i], size)
+                    out = insta.render_overlay(photo, slide, i, n, kind, cfg.brand_name, accent, pos, style)
+                    photo.close()
+                    png = os.path.join(jdir, f"{kind}_{i + 1:02d}.png")
+                    jpg = os.path.join(jdir, f"{kind}_{i + 1:02d}.jpg")
+                    out.save(png)
+                    out.save(jpg, quality=95)
+                    out.close()
+                    return png, jpg
+
+                png, jpg = await asyncio.to_thread(render_one)
+                release_memory()
+                pngs.append(png)
+                jpgs.append(jpg)
+            await status_edit(status, "📤 Отправляю…")
+            if len(jpgs) == 1:
+                await bot.send_photo(chat_id, FSInputFile(jpgs[0]))
+            else:
+                await bot.send_media_group(chat_id, [InputMediaPhoto(media=FSInputFile(p)) for p in jpgs])
+            cap = insta.caption_text(plan)
+            if cap:
+                for chunk in split_text("📝 Подпись к посту:\n\n" + cap):
+                    await bot.send_message(chat_id, chunk)
+            what = f"только текст, {n} ваших фото без изменений"
+            jobs[jid] = {"dir": jdir, "files": pngs, "created": time.time(), "kind": kind}
+            if as_zip:
+                await send_zip(bot, chat_id, jid)
+                await bot.send_message(chat_id, spend.line(what))
+            else:
+                kb = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
+                    text="📦 PNG без сжатия (zip)", callback_data=f"zip:{jid}")]])
+                await bot.send_message(chat_id, spend.line(what), reply_markup=kb)
+            await status_delete(status)
+        except BaseException:
+            shutil.rmtree(jdir, ignore_errors=True)
+            jobs.pop(jid, None)
+            raise
+        finally:
+            for p in jpgs:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+
     async def send_zip(bot: Bot, chat_id: int, jid: str) -> bool:
         j = jobs.get(jid)
         if not j or not all(os.path.exists(p) for p in j["files"]):
@@ -1871,27 +2032,62 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             return
         await handle_insta(m, bot, command.command.lower(), command.args or "")
 
+    def insta_usage(kind: str) -> str:
+        return ("/carousel 7 как выбрать кофемолку\n/carousel 5 zip 5 ошибок новичка в беге\n"
+                "/carousel overlay наш отпуск (текст поверх ваших фото)"
+                if kind == "carousel" else
+                "/story утренняя рутина за 10 минут 3\n/story анонс вебинара 1 zip\n/story overlay день из жизни")
+
     async def handle_insta(m: Message, bot: Bot, kind: str, raw: str, ref_paths: list[str] | None = None,
                            ref_source: str = "") -> None:
         raw, mode, noref = refs.split_flags(raw)
-        n, topic, as_zip, err = parse_args(raw, kind)
-        if err or not topic:
-            ex = ("/carousel 7 как выбрать кофемолку\n/carousel 5 zip 5 ошибок новичка в беге"
-                  if kind == "carousel" else "/story утренняя рутина за 10 минут 3\n/story анонс вебинара 1 zip")
-            await m.answer((err + "\n\n" if err else "") + "Напишите тему, например:\n" + ex)
+        raw, ov = parse_overlay_opts(raw)
+        n, topic, as_zip, err = parse_args(raw, kind, min_n=1)
+        if err:
+            err = parse_args(raw, kind)[3] or err
+            await m.answer(err + "\n\nНапример:\n" + insta_usage(kind))
             return
-        if n is None:
-            n = insta.CAROUSEL_DEFAULT if kind == "carousel" else insta.STORY_DEFAULT
         if ref_paths is None:
             ref_paths, ref_source = await resolve_refs(m, bot, noref)
         if mode and not ref_paths:
-            await m.answer("📎 Флаг bg/style работает с фото: пришлите фото с подписью-командой, ответьте командой на фото "
-                           "или сохраните референсы (просто отправьте фото боту). /ref — подробнее.")
+            await m.answer("📎 Флаг overlay/bg/style работает с фото: пришлите фото с подписью-командой, ответьте "
+                           "командой на фото или сохраните фото (просто отправьте их боту). /ref — подробнее.")
             return
-        mode = (mode or cfg.ref_mode) if ref_paths else None
+        eff = (mode or default_mode(m.from_user.id)) if ref_paths else None
+        if eff != refs.MODE_OVERLAY:
+            if not topic:
+                await m.answer("Напишите тему, например:\n" + insta_usage(kind))
+                return
+            lo = insta.CAROUSEL_MIN if kind == "carousel" else insta.STORY_MIN
+            if n is not None and n < lo:
+                await m.answer(f"Число должно быть от {lo} до 10.\n\nНапример:\n" + insta_usage(kind))
+                return
+        elif not topic and not cfg.ref_vision:
+            await m.answer("Напишите тему после overlay — без REF_VISION Grok не видит фото, например:\n"
+                           f"/{kind} overlay наш отпуск")
+            return
+        await launch_insta(bot, m.chat.id, m.from_user.id, kind, topic, n, as_zip, ref_paths, ref_source, eff, ov)
+
+    async def launch_insta(bot: Bot, chat_id: int, uid: int, kind: str, topic: str, n: int | None, as_zip: bool,
+                           ref_paths: list[str], ref_source: str, mode: str | None, ov: dict | None = None) -> None:
+        if mode == refs.MODE_OVERLAY and ref_paths:
+            photos = list(ref_paths)[:cfg.ref_overlay_max]
+            k = min(n or len(photos), len(photos))
+            if n and n > len(photos):
+                await bot.send_message(chat_id, f"ℹ️ Фото: {len(photos)} — будет {k} "
+                                                f"{'слайдов' if kind == 'carousel' else 'кадров'} (просили {n}).")
+            params = {"topic": topic, "n": k, "as_zip": as_zip, "ref_paths": photos[:k], "ref_mode": mode,
+                      "ref_source": ref_source, **(ov or {})}
+            await precheck(bot, chat_id, uid, kind, params, overlay_estimate(k))
+            return
+        if n is None:
+            n = insta.CAROUSEL_DEFAULT if kind == "carousel" else insta.STORY_DEFAULT
+        if mode is None:
+            ref_paths = []
+        ref_paths = list(ref_paths)[-cfg.ref_max:]
         est = cfg.est_chat_usd + images_estimate(n, cfg.insta_image_resolution, len(ref_paths), mode)
-        await precheck_and_run(m, bot, kind, {"topic": topic, "n": n, "as_zip": as_zip, "ref_paths": ref_paths,
-                                              "ref_mode": mode, "ref_source": ref_source}, est)
+        await precheck(bot, chat_id, uid, kind, {"topic": topic, "n": n, "as_zip": as_zip, "ref_paths": ref_paths,
+                                                 "ref_mode": mode, "ref_source": ref_source}, est)
 
     @dp.message(Command("storyvideo"))
     async def cmd_storyvideo(m: Message, command: CommandObject, bot: Bot) -> None:
@@ -1963,6 +2159,8 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         ]])
 
     def meme_estimate(n: int, k: int = 0, mode: str | None = None) -> float:
+        if mode == refs.MODE_OVERLAY:
+            return overlay_estimate(n)
         return cfg.est_chat_usd + images_estimate(n, cfg.meme_image_resolution, k, mode)
 
     async def load_image(raw: bytes) -> Image.Image | None:
@@ -1982,8 +2180,97 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             log.warning("meme send_photo failed (%s), sending as document", e)
             await bot.send_document(chat_id, FSInputFile(j["png"]), caption=caption[:1024], reply_markup=meme_kb(jid))
 
+    async def launch_meme(bot: Bot, chat_id: int, uid: int, animal: str, topic: str, n: int, story: bool,
+                          ref_paths: list[str] | tuple = (), ref_source: str = "", mode: str | None = None) -> None:
+        paths = list(ref_paths or [])
+        if not paths:
+            mode = None
+        if mode == refs.MODE_OVERLAY:
+            photos = paths[:cfg.ref_overlay_max]
+            k = max(1, min(n, len(photos)))
+            if n > len(photos):
+                await bot.send_message(chat_id, f"ℹ️ Фото: {len(photos)} — будет {k} мем(а), по одному на фото.")
+            await precheck(bot, chat_id, uid, "meme", {"animal": "photo", "topic": topic, "n": k, "story": story,
+                                                       "ref_paths": photos[:k], "ref_mode": mode,
+                                                       "ref_source": ref_source}, overlay_estimate(k))
+            return
+        paths = paths[-cfg.ref_max:] if mode else []
+        await precheck(bot, chat_id, uid, "meme", {"animal": animal, "topic": topic, "n": n, "story": story,
+                                                   "ref_paths": paths, "ref_mode": mode, "ref_source": ref_source},
+                       meme_estimate(n, len(paths), mode))
+
+    async def run_meme_overlay(bot: Bot, chat_id: int, user_id: int, topic: str, n: int, story: bool,
+                               paths: list[str], ref_source: str) -> None:
+        """Мем поверх фото пользователя: фото без изменений (только crop), подпись от Grok по фото и теме."""
+        spend = Spend(bot)
+        paths = paths[:max(1, n)]
+        n = len(paths)
+        status = await bot.send_message(
+            chat_id, ref_line(n, refs.MODE_OVERLAY, ref_source) + f"\n✍️ Придумываю {'подписи' if n > 1 else 'подпись'}"
+                     f"{(' — ' + topic) if topic else ''} (оценка ≈{fmt_cost(overlay_estimate(n))})")
+        try:
+            images = None
+            if cfg.ref_vision:
+                images = await asyncio.to_thread(lambda: [refs.data_uri(p, refs.OVERLAY_VISION_SIDE) for p in paths])
+            async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
+                data, cost = await xai.chat_json(memes.overlay_meme_messages(topic, n, story, images),
+                                                 memes.meme_schema(), name="memes")
+            del images
+            await spend.add(cost)
+        except XAIError as e:
+            log.error("meme overlay text error: %s", e)
+            await spend.add(e.cost)
+            await status_edit(status, error_text(e) + ("\n\n" + spend.line() if spend.usd else ""))
+            return
+        a = memes.photo_animal()
+        items = memes.normalize_memes(data, n, a)
+        if not items:
+            await status_edit(status, "🤷 Grok не придумал подпись. Попробуйте ещё раз или уточните тему.\n\n"
+                              + spend.line("текст"))
+            return
+        size = insta.STORY_SIZE if story else insta.CAROUSEL_SIZE
+        for i, it in enumerate(items):
+            await status_edit(status, f"🖼 Накладываю подпись {i + 1}/{len(items)}…")
+            jid = secrets.token_hex(5)
+            jdir = os.path.join(work_root, "m" + jid)
+            os.makedirs(jdir, exist_ok=True)
+            bg_path = os.path.join(jdir, "photo.jpg")
+            shutil.copyfile(paths[i], bg_path)  # тот же файл — «Другая подпись» ляжет на то же фото
+            seed = secrets.randbelow(1000)
+
+            def render_one(it=it) -> str:
+                photo = insta.open_photo(bg_path, size)
+                out = memes.render_meme(photo, it.top, it.bottom, story=story, watermark=cfg.brand_name, seed=seed)
+                photo.close()
+                png = os.path.join(jdir, "meme_1.png")
+                out.save(png)
+                out.close()
+                return png
+
+            png = await asyncio.to_thread(render_one)
+            release_memory()
+            scene = it.scene if it.scene and "looking funny" not in it.scene else "the user's photo"
+            meme_jobs[jid] = {"dir": jdir, "png": png, "bg": bg_path, "seed": seed, "animal": "photo",
+                              "topic": topic, "story": story, "scene": scene, "history": [it.label],
+                              "created": time.time(), "user": user_id, "ver": 1, "ref_paths": [bg_path],
+                              "ref_mode": refs.MODE_OVERLAY, "ref_source": ref_source}
+            cap = f"🖼 Ваше фото{(' · ' + topic) if topic else ''}" + (f" · {i + 1}/{len(items)}" if len(items) > 1 else "")
+            if cfg.show_cost and len(items) == 1:
+                cap += "\n\n" + spend.line("только текст, фото без изменений")
+            await send_meme(bot, chat_id, jid, cap)
+        if len(items) > 1:
+            await bot.send_message(chat_id, spend.line(f"только текст, {len(items)} ваших фото без изменений")
+                                   + (f"\nGrok вернул {len(items)} из {n}." if len(items) < n else ""))
+        await status_delete(status)
+
     async def run_meme(bot: Bot, chat_id: int, user_id: int, animal: str, topic: str, n: int, story: bool,
                        ref_paths: list[str] | tuple = (), ref_mode: str | None = None, ref_source: str = "") -> None:
+        if ref_mode == refs.MODE_OVERLAY:
+            ps = [p for p in ref_paths if os.path.exists(p)]
+            if ps:
+                await run_meme_overlay(bot, chat_id, user_id, topic, n, story, ps, ref_source)
+                return
+            ref_mode = None
         a = animal_by_key(animal)
         spend = Spend(bot)
         rc = {"paths": [p for p in ref_paths if os.path.exists(p)], "mode": ref_mode}
@@ -2160,10 +2447,18 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         if ref_paths is None:
             ref_paths, ref_source = await resolve_refs(m, bot, noref)
         if mode and not ref_paths:
-            await m.answer("📎 Флаг bg/style работает с фото: пришлите фото с подписью /meme bg …, ответьте командой "
-                           "на фото или сохраните референсы. /ref — подробнее.")
+            await m.answer("📎 Флаг overlay/bg/style работает с фото: пришлите фото с подписью /meme overlay …, "
+                           "ответьте командой на фото или сохраните фото. /ref — подробнее.")
             return
-        mode = (mode or cfg.ref_mode) if ref_paths else None
+        flag_mode = mode
+        mode = (mode or default_mode(m.from_user.id)) if ref_paths else None
+        if mode == refs.MODE_OVERLAY and (flag_mode == refs.MODE_OVERLAY or args.animal is None):
+            await launch_meme(bot, m.chat.id, m.from_user.id, "photo", args.topic, args.n, args.story,
+                              ref_paths, ref_source, mode)
+            return
+        if mode == refs.MODE_OVERLAY:  # зверь назван явно, а overlay — лишь режим по умолчанию → генерация по фото
+            mode = refs.MODE_EDIT
+        ref_paths = list(ref_paths)[-cfg.ref_max:] if ref_paths else ref_paths
         rp = {"ref_paths": ref_paths, "ref_mode": mode, "ref_source": ref_source}
         if args.animal is None and ref_paths:
             await precheck_and_run(m, bot, "meme", {"animal": "photo", "topic": args.topic, "n": args.n,
@@ -2316,13 +2611,15 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         cmd = cm.group(1).lower() if cm else ""
         args = (cm.group(2) or "") if cm else ""
         if cm and cmd in PHOTO_COMMANDS:
-            limit = refs.API_MAX_REFS if cmd != "img" else refs.API_MAX_REFS
-            take = msgs[:min(limit, cfg.ref_max)]
+            flag = refs.split_flags(args)[1]
+            overlay = cmd != "img" and (flag or default_mode(m.from_user.id)) == refs.MODE_OVERLAY
+            limit = cfg.ref_overlay_max if overlay else cfg.ref_max
+            take = msgs[:limit]
             d = new_tmp_dir()
             paths = []
             for i, x in enumerate(take):
                 try:
-                    p = await download_ref(bot, x, d, f"ref_{i + 1}.jpg")
+                    p = await download_ref(bot, x, d, f"ref_{i + 1:02d}.jpg")
                     if p:
                         paths.append(p)
                 except Exception as e:  # noqa: BLE001
@@ -2331,7 +2628,8 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                 await m.answer("😕 Не удалось получить фото. Пришлите JPG/PNG до 20 МБ.")
                 return
             if len(msgs) > len(take):
-                await m.answer(f"ℹ️ Беру первые {len(take)} фото (лимит REF_MAX={cfg.ref_max}).")
+                await m.answer(f"ℹ️ Беру первые {len(take)} фото (лимит "
+                               f"{'REF_OVERLAY_MAX' if overlay else 'REF_MAX'}={limit}).")
             src = "прикреплённые фото"
             if cmd in ("carousel", "story"):
                 await handle_insta(m, bot, cmd, args, paths, src)
@@ -2356,18 +2654,22 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                 log.warning("не удалось сохранить референс: %s", e)
         paths = refs.list_refs(d)
         dropped = 0
-        while len(paths) > cfg.ref_max:
+        while len(paths) > cfg.ref_store_max:
             os.remove(paths.pop(0))
             dropped += 1
         if not added:
             await m.answer("😕 Не удалось сохранить фото. Пришлите JPG/PNG до 20 МБ.")
             return
         await m.answer(
-            f"📌 Референсы сохранены: {len(paths)} из {cfg.ref_max}"
+            f"📌 Фото сохранены: {len(paths)} из {cfg.ref_store_max}"
             + (f" (старые {dropped} удалены)" if dropped else "") + ".\n"
-            f"Теперь /carousel, /story и /meme будут их учитывать (режим по умолчанию: {refs.MODE_TITLES[cfg.ref_mode]}).\n"
-            "Флаги в команде: bg — фото как фон, style — только стиль, noref — без референсов.\n"
-            f"/ref — посмотреть, /ref clear — удалить. Хранятся {int(cfg.ref_ttl_sec // 60)} мин.")
+            f"Теперь /carousel, /story и /meme будут их учитывать (режим: {refs.MODE_TITLES[default_mode(uid)]}).\n"
+            f"Флаги в команде: overlay — текст поверх ваших фото без изменений (до {cfg.ref_overlay_max} фото = слайдов), "
+            f"bg — фото как фон, style — только стиль, noref — без референсов. Для edit/style/bg берутся последние "
+            f"{cfg.ref_max}.\n"
+            f"/ref — посмотреть, /ref mode overlay — режим по умолчанию, /ref clear — удалить. "
+            f"Хранятся {int(cfg.ref_ttl_sec // 60)} мин.",
+            reply_markup=refs_kb(uid, len(paths)))
 
     @dp.message(Command("ref"))
     async def cmd_ref(m: Message, command: CommandObject, bot: Bot) -> None:
@@ -2380,14 +2682,392 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             shutil.rmtree(user_ref_dir(uid), ignore_errors=True)
             await m.answer("🧹 Референсы удалены.")
             return
+        words = arg.split()
+        if words and (words[0] in ("mode", "режим") or (len(words) == 1 and words[0] in refs.MODE_WORDS)):
+            val = words[-1] if words[0] in ("mode", "режим") and len(words) > 1 else words[0]
+            if val in ("default", "сброс", "env", "по-умолчанию"):
+                ref_user_mode.pop(uid, None)
+                await m.answer(f"↩️ Режим сброшен на настройку бота: {refs.MODE_TITLES[cfg.ref_mode]}.")
+                return
+            if val not in refs.MODE_WORDS:
+                await m.answer("Режимы: /ref mode overlay | edit | style | bg | default")
+                return
+            ref_user_mode[uid] = refs.MODE_WORDS[val]
+            await m.answer(f"✅ Режим для ваших фото: {refs.MODE_TITLES[ref_user_mode[uid]]}.")
+            return
+        await show_refs(m.chat.id, uid, bot)
+
+    def refs_kb(uid: int, k: int) -> InlineKeyboardMarkup:
+        cur = default_mode(uid)
+        names = {refs.MODE_OVERLAY: "🖼 Мои фото + текст", refs.MODE_EDIT: "🎨 Перерисовать",
+                 refs.MODE_STYLE: "🎭 Только стиль", refs.MODE_BG: "🧱 Фото как фон"}
+        btns = [InlineKeyboardButton(text=("✅ " if md == cur else "") + t, callback_data=f"rf:mode:{md}")
+                for md, t in names.items()]
+        rows = [btns[:2], btns[2:]]
+        if k:
+            rows.append([InlineKeyboardButton(text="🧹 Очистить", callback_data="rf:clear")])
+        return InlineKeyboardMarkup(inline_keyboard=rows)
+
+    async def show_refs(chat_id: int, uid: int, bot: Bot) -> None:
         paths = user_refs(uid)
         if not paths:
-            await m.answer(REF_HELP.format(n=cfg.ref_max, ttl=int(cfg.ref_ttl_sec // 60)))
+            await bot.send_message(chat_id, REF_HELP.format(n=cfg.ref_store_max, o=cfg.ref_overlay_max,
+                                                            ttl=int(cfg.ref_ttl_sec // 60)),
+                                   reply_markup=refs_kb(uid, 0))
             return
         sheet = await asyncio.to_thread(refs.contact_sheet, paths)
-        await m.answer_photo(BufferedInputFile(sheet, filename="refs.jpg"),
-                             caption=f"📎 Ваши референсы: {len(paths)} из {cfg.ref_max}. Режим по умолчанию: "
-                                     f"{refs.MODE_TITLES[cfg.ref_mode]}.\n/ref clear — удалить.")
+        await bot.send_photo(chat_id, BufferedInputFile(sheet, filename="refs.jpg"),
+                             caption=f"📎 Ваши фото: {len(paths)} из {cfg.ref_store_max} (в порядке загрузки). "
+                                     f"Режим: {refs.MODE_TITLES[default_mode(uid)]}.\n"
+                                     "Пришлите ещё фото, чтобы добавить; /ref clear — удалить.",
+                             reply_markup=refs_kb(uid, len(paths)))
+
+    @dp.callback_query(F.data.regexp(r"^rf:(clear|mode:(edit|style|bg|overlay))$"))
+    async def on_refs_button(cq: CallbackQuery) -> None:
+        if not cq.from_user or not uid_allowed(cq.from_user.id):
+            await cq.answer("Нет доступа", show_alert=True)
+            return
+        uid = cq.from_user.id
+        if cq.data == "rf:clear":
+            shutil.rmtree(user_ref_dir(uid), ignore_errors=True)
+            await cq.answer("Удалено")
+            await cq.message.answer("🧹 Референсы удалены.")
+        else:
+            md = cq.data.split(":")[2]
+            ref_user_mode[uid] = md
+            await cq.answer("Режим выбран")
+            await cq.message.answer(f"✅ Режим для ваших фото: {refs.MODE_TITLES[md]}.")
+        try:
+            await cq.message.edit_reply_markup(reply_markup=refs_kb(uid, len(user_refs(uid))))
+        except TelegramBadRequest:
+            pass
+
+    # ------------------------------------------------------------------
+    # Кнопочное меню (ReplyKeyboard) и мастера на FSM (MemoryStorage)
+    # ------------------------------------------------------------------
+    meme_topics = memes.load_topics(cfg.meme_topics)
+
+    def ikb(rows: list[list[tuple[str, str]]]) -> InlineKeyboardMarkup:
+        return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=t, callback_data=c) for t, c in r]
+                                                     for r in rows if r])
+
+    def wcb(tok: str, act: str, val: object = "") -> str:
+        return f"wz:{tok}:{act}:{val}"[:64]
+
+    def cancel_row(tok: str) -> list[tuple[str, str]]:
+        return [(WIZ_CANCEL, wcb(tok, "x"))]
+
+    async def wiz_new(state: FSMContext, wiz: str, st: State, **data) -> str:
+        await state.clear()
+        tok = secrets.token_hex(3)
+        await state.set_state(st)
+        await state.set_data({"wiz": wiz, "tok": tok, **data})
+        return tok
+
+    @dp.message.outer_middleware()
+    async def reset_wizard_on_command(handler, event: Message, data: dict):
+        """Любая /команда посреди мастера закрывает мастер (старые команды работают как раньше)."""
+        st: FSMContext | None = data.get("state")
+        txt = event.text or event.caption or ""
+        if st is not None and txt.startswith("/"):
+            if await st.get_state() is not None:
+                await st.clear()
+        return await handler(event, data)
+
+    @dp.message(Command("cancel"))
+    async def cmd_cancel(m: Message, state: FSMContext) -> None:
+        await state.clear()
+        if not allowed(m):
+            await deny(m)
+            return
+        await m.answer("✖️ Отменено. Выберите действие в меню.", reply_markup=main_menu(is_admin(m)))
+
+    @dp.message(F.text.in_(MENU_ALL), F.chat.type == ChatType.PRIVATE)
+    async def on_menu(m: Message, bot: Bot, state: FSMContext) -> None:
+        """Нажатие кнопки меню: никогда не уходит в чат Grok; посреди мастера — сбрасывает его."""
+        await state.clear()
+        if not allowed(m):
+            await m.answer("⛔ Меню недоступно.", reply_markup=ReplyKeyboardRemove())
+            await deny(m)
+            return
+        t = m.text
+        uid = m.from_user.id
+        if t in (MENU_CAROUSEL, MENU_STORY):
+            kind = "carousel" if t == MENU_CAROUSEL else "story"
+            tok = await wiz_new(state, kind, Wiz.text, step="topic")
+            await m.answer(("🖼 Карусель" if kind == "carousel" else "📱 Сторис") + " — шаг 1/3.\n"
+                           "Напишите тему одним сообщением, например: 5 ошибок новичка в кофейне",
+                           reply_markup=ikb([cancel_row(tok)]))
+        elif t == MENU_VIDEO:
+            tok = await wiz_new(state, "video", Wiz.choose, step="seconds")
+            secs = [s for s in (5, 8, 10, 15)]
+            await m.answer(f"🎬 Видео 9:16 — шаг 1/2. Длительность? (≈{fmt_cost(cfg.video_price())}/сек)",
+                           reply_markup=ikb([[(f"{s} сек", wcb(tok, "s", s)) for s in secs], cancel_row(tok)]))
+        elif t == MENU_IMG:
+            tok = await wiz_new(state, "img", Wiz.text, step="prompt")
+            await m.answer("🎨 Картинка — шаг 1/2. Опишите, что нарисовать, например: рыжий кот в скафандре на Луне",
+                           reply_markup=ikb([cancel_row(tok)]))
+        elif t == MENU_SEARCH:
+            tok = await wiz_new(state, "search", Wiz.text, step="query")
+            await m.answer("🔎 Поиск в интернете и X. Напишите запрос, например: что нового у xAI на этой неделе",
+                           reply_markup=ikb([cancel_row(tok)]))
+        elif t == MENU_CHAT:
+            await m.answer("💬 Напишите что угодно — я отвечу. История помнит последние "
+                           f"{HISTORY_TURNS} реплик.", reply_markup=ikb([[("🧹 Новый диалог", "wz:chat:new:")]]))
+        elif t == MENU_MEME:
+            tok = await wiz_new(state, "meme", Wiz.choose, step="topic")
+            await m.answer("🐱 Мем — выберите тему:", reply_markup=meme_topic_kb(tok))
+        elif t == MENU_REFS:
+            await show_refs(m.chat.id, uid, bot)
+            await m.answer(f"📎 Чтобы добавить фото — просто отправьте их сюда (можно альбомом, до "
+                           f"{cfg.ref_store_max}). Режим выбирается кнопками выше.")
+        elif t == MENU_BALANCE:
+            await cmd_balance(m, bot)
+        elif t == MENU_USERS:
+            await cmd_users(m)
+            if is_admin(m):
+                await m.answer("ℹ️ Добавить: /adduser <ID> [заметка] (или ответом на пересланное сообщение), "
+                               "удалить: /deluser <ID>. Заявки приходят сюда с кнопками.")
+
+    def meme_topic_kb(tok: str) -> InlineKeyboardMarkup:
+        btns = [(tp.title, wcb(tok, "t", i)) for i, tp in enumerate(meme_topics)]
+        btns += [("🎲 Случайная", wcb(tok, "t", "r")), ("✏️ Своя тема", wcb(tok, "t", "c"))]
+        return ikb([btns[i:i + 2] for i in range(0, len(btns), 2)] + [cancel_row(tok)])
+
+    async def meme_after_topic(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict) -> None:
+        tok = d["tok"]
+        k = len(user_refs(uid))
+        tname = f"«{d['topic']}»" if d.get("topic") else "любая"
+        if k:
+            d["step"] = "src"
+            await state.set_state(Wiz.choose)
+            await state.set_data(d)
+            await bot.send_message(chat_id, f"Тема: {tname}. У вас {k} фото — из чего делать мем?",
+                                   reply_markup=ikb([[("🐾 Зверёк (генерация)", wcb(tok, "src", "animal"))],
+                                                     [("🎨 Перерисовать по фото", wcb(tok, "src", "edit"))],
+                                                     [("🖼 Моё фото + подпись", wcb(tok, "src", "overlay"))],
+                                                     cancel_row(tok)]))
+            return
+        d["src"] = "animal"
+        await meme_animal_step(bot, chat_id, state, d, f"Тема: {tname}. ")
+
+    async def meme_animal_step(bot: Bot, chat_id: int, state: FSMContext, d: dict, prefix: str = "") -> None:
+        tok = d["tok"]
+        d["step"] = "animal"
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        btns = [(a.name, wcb(tok, "an", i)) for i, a in enumerate(animals)]
+        first = [("🎲 Случайный", wcb(tok, "an", "r"))]
+        if d.get("src") == "edit":
+            first.append(("📷 С вашего фото", wcb(tok, "an", "p")))
+        await bot.send_message(chat_id, prefix + "Кто герой мема?",
+                               reply_markup=ikb([first] + [btns[i:i + 2] for i in range(0, len(btns), 2)]
+                                                + [cancel_row(tok)]))
+
+    async def meme_format_step(bot: Bot, chat_id: int, state: FSMContext, d: dict) -> None:
+        tok = d["tok"]
+        d["step"] = "format"
+        await state.set_data(d)
+        await bot.send_message(chat_id, "Формат?", reply_markup=ikb([[("🟦 Пост 1:1", wcb(tok, "f", "post")),
+                                                                      ("📱 Сторис 9:16", wcb(tok, "f", "story"))],
+                                                                     cancel_row(tok)]))
+
+    async def run_image_wizard(bot: Bot, chat_id: int, prompt: str, aspect: str) -> None:
+        try:
+            async with ChatActionSender(bot=bot, chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO):
+                img, mime, cost = await xai.image(prompt, aspect)
+                line = await account(bot, cost)
+        except XAIError as e:
+            log.error("image (wizard) error: %s", e)
+            await bot.send_message(chat_id, error_text(e))
+            return
+        ext = {"image/png": "png", "image/webp": "webp"}.get(mime.split(";")[0], "jpg")
+        tail = ("\n\n" + line) if cfg.show_cost else ""
+        caption = ("🎨 " + prompt)[: 1024 - len(tail)] + tail
+        try:
+            await bot.send_photo(chat_id, BufferedInputFile(img, filename=f"grok.{ext}"), caption=caption)
+        except TelegramBadRequest:
+            await bot.send_document(chat_id, BufferedInputFile(img, filename=f"grok.{ext}"), caption=caption)
+
+    @dp.message(StateFilter(Wiz.text), F.text & ~F.text.startswith("/"), F.chat.type == ChatType.PRIVATE)
+    async def on_wizard_text(m: Message, bot: Bot, state: FSMContext) -> None:
+        if not allowed(m):
+            await state.clear()
+            await deny(m)
+            return
+        d = await state.get_data()
+        wiz, step, tok = d.get("wiz"), d.get("step"), d.get("tok", "")
+        txt = (m.text or "").strip()
+        if wiz in ("carousel", "story") and step == "topic":
+            d.update(topic=txt[:400], step="count")
+            await state.set_state(Wiz.choose)
+            await state.set_data(d)
+            what = "слайдов" if wiz == "carousel" else "кадров"
+            await m.answer(f"Шаг 2/3. Сколько {what}?",
+                           reply_markup=ikb([[(str(x), wcb(tok, "n", x)) for x in (3, 5, 7, 10)], cancel_row(tok)]))
+        elif wiz == "video" and step == "prompt":
+            await state.clear()
+            sec = int(d.get("seconds") or cfg.video_duration)
+            await precheck_and_run(m, bot, "storyvideo", {"prompt": txt, "seconds": sec}, sec * cfg.video_price())
+        elif wiz == "img" and step == "prompt":
+            d.update(prompt=txt[:1500], step="aspect")
+            await state.set_state(Wiz.choose)
+            await state.set_data(d)
+            await m.answer("Шаг 2/2. Формат?", reply_markup=ikb([[("🟦 1:1", wcb(tok, "a", "1:1")),
+                                                                 ("📱 9:16", wcb(tok, "a", "9:16"))],
+                                                                cancel_row(tok)]))
+        elif wiz == "search":
+            await state.clear()
+            await answer_chat(m, bot, txt, "force")
+        elif wiz == "meme" and step == "topic_text":
+            d["topic"] = txt[:200]
+            await meme_after_topic(bot, m.chat.id, m.from_user.id, state, d)
+        else:
+            await state.clear()
+            await answer_chat(m, bot, txt, "auto" if cfg.search_mode == "auto" else None)
+
+    @dp.message(StateFilter(Wiz.choose), F.text & ~F.text.startswith("/"), F.chat.type == ChatType.PRIVATE)
+    async def on_wizard_choose_text(m: Message, state: FSMContext) -> None:
+        if not allowed(m):
+            await state.clear()
+            await deny(m)
+            return
+        await m.answer("👆 Выберите вариант кнопкой выше или нажмите «✖️ Отмена» (или /cancel).")
+
+    @dp.callback_query(F.data.startswith("wz:"))
+    async def on_wizard_button(cq: CallbackQuery, bot: Bot, state: FSMContext) -> None:
+        if not cq.from_user or not uid_allowed(cq.from_user.id):
+            await cq.answer("Нет доступа", show_alert=True)
+            return
+        parts = (cq.data or "").split(":", 3)
+        if len(parts) != 4:
+            await cq.answer()
+            return
+        _, tok, act, val = parts
+        uid = cq.from_user.id
+        chat_id = cq.message.chat.id if cq.message else uid
+        if tok == "chat" and act == "new":
+            history.pop(uid, None)
+            await cq.answer("Новый диалог")
+            await bot.send_message(chat_id, "🧹 История очищена. Начинаем новый диалог!")
+            return
+        d = await state.get_data()
+        if not d or d.get("tok") != tok:
+            await cq.answer("Этот шаг уже неактуален — нажмите кнопку в меню заново.", show_alert=True)
+            return
+        await cq.answer()
+        if cq.message:
+            try:
+                await cq.message.edit_reply_markup(reply_markup=None)
+            except TelegramBadRequest:
+                pass
+        if act == "x":
+            await state.clear()
+            await bot.send_message(chat_id, "✖️ Отменено.", reply_markup=main_menu(uid in cfg.admin_user_ids))
+            return
+        wiz = d.get("wiz")
+        try:
+            if wiz in ("carousel", "story"):
+                if act == "n" and d.get("step") == "count":
+                    d["n"] = int(val)
+                    k = len(user_refs(uid))
+                    if not k:
+                        await state.clear()
+                        await launch_insta(bot, chat_id, uid, wiz, d["topic"], d["n"], False, [], "", None)
+                        return
+                    d["step"] = "mode"
+                    await state.set_data(d)
+                    await bot.send_message(chat_id, f"Шаг 3/3. У вас {k} фото. Как их использовать?", reply_markup=ikb([
+                        [("Без референсов", wcb(tok, "m", "none"))],
+                        [("С референсами (перерисовать)", wcb(tok, "m", "edit"))],
+                        [(f"🖼 Мои фото + текст ({min(k, cfg.ref_overlay_max)} фото)", wcb(tok, "m", "overlay"))],
+                        cancel_row(tok)]))
+                    return
+                if act == "m" and d.get("step") == "mode":
+                    await state.clear()
+                    paths = user_refs(uid)
+                    if val == "none" or not paths:
+                        await launch_insta(bot, chat_id, uid, wiz, d["topic"], d["n"], False, [], "", None)
+                    elif val == "overlay":
+                        await launch_insta(bot, chat_id, uid, wiz, d["topic"], d["n"], False, paths, "сохранённые",
+                                           refs.MODE_OVERLAY)
+                    else:
+                        await launch_insta(bot, chat_id, uid, wiz, d["topic"], d["n"], False, paths, "сохранённые",
+                                           refs.MODE_EDIT)
+                    return
+            elif wiz == "video" and act == "s":
+                d.update(seconds=max(1, min(15, int(val))), step="prompt")
+                await state.set_state(Wiz.text)
+                await state.set_data(d)
+                await bot.send_message(chat_id, "Шаг 2/2. Опишите видео, например: чашка кофе на подоконнике, пар, "
+                                                "утренний свет, камера медленно приближается",
+                                       reply_markup=ikb([cancel_row(tok)]))
+                return
+            elif wiz == "img" and act == "a" and d.get("prompt"):
+                await state.clear()
+                await run_image_wizard(bot, chat_id, d["prompt"], "9:16" if val == "9:16" else "1:1")
+                return
+            elif wiz == "meme":
+                step = d.get("step")
+                if act == "t" and step == "topic":
+                    if val == "c":
+                        d["step"] = "topic_text"
+                        await state.set_state(Wiz.text)
+                        await state.set_data(d)
+                        await bot.send_message(chat_id, "✏️ Напишите тему мема, например: дедлайны в пятницу",
+                                               reply_markup=ikb([cancel_row(tok)]))
+                        return
+                    tp = memes.random.choice(meme_topics) if val == "r" else meme_topics[int(val)]
+                    d["topic"] = tp.name
+                    await meme_after_topic(bot, chat_id, uid, state, d)
+                    return
+                if act == "src" and step == "src" and val in ("animal", "edit", "overlay"):
+                    d["src"] = val
+                    if val == "overlay":
+                        d["animal"] = "photo"
+                        await meme_format_step(bot, chat_id, state, d)
+                    else:
+                        await meme_animal_step(bot, chat_id, state, d)
+                    return
+                if act == "an" and step == "animal":
+                    if val == "r":
+                        d["animal"] = memes.random.choice(animals).key
+                    elif val == "p":
+                        d["animal"] = "photo"
+                    else:
+                        d["animal"] = animals[int(val)].key
+                    await meme_format_step(bot, chat_id, state, d)
+                    return
+                if act == "f" and step == "format":
+                    d.update(story=(val == "story"), step="count")
+                    await state.set_data(d)
+                    counts = [1, 3, 5]
+                    note = ""
+                    if d.get("src") == "overlay":
+                        k = min(len(user_refs(uid)), cfg.ref_overlay_max)
+                        counts = [c for c in counts if c <= k] or [1]
+                        if k not in counts and k < 5:
+                            counts.append(k)
+                        note = f" (по одному на фото, у вас {k})"
+                    await bot.send_message(chat_id, "Сколько мемов?" + note,
+                                           reply_markup=ikb([[(str(c), wcb(tok, "n", c)) for c in counts],
+                                                             cancel_row(tok)]))
+                    return
+                if act == "n" and step == "count":
+                    await state.clear()
+                    src = d.get("src", "animal")
+                    paths = user_refs(uid) if src in ("edit", "overlay") else []
+                    mode = {"edit": refs.MODE_EDIT, "overlay": refs.MODE_OVERLAY}.get(src) if paths else None
+                    animal = d.get("animal") or memes.random.choice(animals).key
+                    if animal == "photo" and not paths:
+                        animal = memes.random.choice(animals).key
+                    await launch_meme(bot, chat_id, uid, animal, d.get("topic", ""), int(val), bool(d.get("story")),
+                                      paths, "сохранённые" if paths else "", mode)
+                    return
+        except (ValueError, IndexError):
+            pass
+        await bot.send_message(chat_id, "Не понял выбор — начните заново кнопкой меню.")
+        await state.clear()
 
     @dp.message(F.text & ~F.text.startswith("/"), F.chat.type == ChatType.PRIVATE)
     async def on_text(m: Message, bot: Bot) -> None:
@@ -2485,7 +3165,9 @@ def describe(cfg: Config) -> str:
             f"warn={list(cfg.warn_thresholds)} video={cfg.video_model} {cfg.video_resolution} "
             f"brand={cfg.brand_name or '-'} meme_animals={len(memes.load_animals(cfg.meme_animals))} "
             f"search={cfg.search_mode}({cfg.search_tools}, src≤{cfg.search_max_sources}) "
-            f"refs={cfg.ref_mode}/max{cfg.ref_max}/q={cfg.ref_edit_quality}/vision={'on' if cfg.ref_vision else 'off'}")
+            f"refs={cfg.ref_mode}/max{cfg.ref_max}/q={cfg.ref_edit_quality}/vision={'on' if cfg.ref_vision else 'off'} "
+            f"overlay=max{cfg.ref_overlay_max}/{cfg.overlay_text_pos}/{cfg.overlay_style} "
+            f"meme_topics={len(memes.load_topics(cfg.meme_topics))}")
 
 
 async def main() -> int:
