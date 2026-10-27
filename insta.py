@@ -225,7 +225,10 @@ def placeholder_background(size: tuple[int, int], seed: int = 0) -> Image.Image:
     return img
 
 
-def _font(path: str, size: int) -> ImageFont.FreeTypeFont:
+def _font(path, size: int):
+    """path — путь к TTF или объект с .load(size) (textstyle.FontRef: шрифт стиля текста)."""
+    if hasattr(path, "load"):
+        return path.load(size)
     return ImageFont.truetype(path, size)
 
 
@@ -281,6 +284,11 @@ class TextBlock:
         return self.line_h * len(self.lines) if self.lines else 0
 
 
+def has_overlong_word(text: str, font, max_w: int) -> bool:
+    """Есть ли слово, которое не влезает в строку целиком (его пришлось бы резать переносом «слово-»)."""
+    return any(font.getlength(w) > max_w for w in typograph(text).replace("\n", " ").split(" ") if w)
+
+
 def fit_block(text: str, path: str, max_w: int, max_h: int, start: int, minimum: int,
               spacing: float = 1.22) -> TextBlock:
     size = start
@@ -288,6 +296,9 @@ def fit_block(text: str, path: str, max_w: int, max_h: int, start: int, minimum:
         font = _font(path, size)
         lines = wrap_text(text, font, max_w) if text else []
         lh = int(size * spacing)
+        if size > minimum and text and has_overlong_word(text, font, max_w):
+            size -= 2   # лучше чуть уменьшить шрифт, чем рвать слово
+            continue
         if lh * len(lines) <= max_h or size <= minimum:
             if lh * len(lines) > max_h:  # даже минимальный размер не влез — обрезаем с многоточием
                 keep = max(1, max_h // lh)
@@ -328,9 +339,20 @@ def _pill(draw: ImageDraw.ImageDraw, xy_right_top: tuple[int, int], text: str, f
 LAST_LAYOUT: dict = {}  # геометрия последнего рендера (для тестов)
 
 
+def _style_parts(style, mode: str, slide: Slide):
+    """(fx, шрифт заголовка, шрифт текста, множитель размера, заголовок). style=None → как раньше."""
+    if style is None:
+        return None, FONT_TITLE, FONT_BODY, 1.0, slide.title
+    import textstyle as ts
+    fx = ts.resolve(style, mode)
+    return fx, ts.title_ref(style), ts.body_ref(style), fx.size_k, ts.apply_case(slide.title, fx.case)
+
+
 def render_slide(bg: Image.Image | None, slide: Slide, idx: int, total: int, kind: str,
-                 brand_name: str = "", accent: tuple[int, int, int] = (255, 213, 74)) -> Image.Image:
-    """idx — с 0. Возвращает RGB-картинку 1080x1080 (карусель) или 1080x1920 (сторис)."""
+                 brand_name: str = "", accent: tuple[int, int, int] = (255, 213, 74),
+                 style=None) -> Image.Image:
+    """idx — с 0. Возвращает RGB-картинку 1080x1080 (карусель) или 1080x1920 (сторис).
+    style — textstyle.TextStyle (шрифт/цвет/эффекты); None — стандартный вид."""
     size = CAROUSEL_SIZE if kind == "carousel" else STORY_SIZE
     W, H = size
     base = fit_cover(bg, size) if bg is not None else placeholder_background(size, idx)
@@ -351,9 +373,11 @@ def render_slide(bg: Image.Image | None, slide: Slide, idx: int, total: int, kin
     title_start = 100 if (kind == "carousel" and is_first) else (92 if kind == "story" else 72)
     body_start = 44 if kind == "carousel" else 50
     avail = area_bottom - area_top
-    title = fit_block(slide.title, FONT_TITLE, max_w, int(avail * 0.55), title_start, 40, 1.12)
+    fx, tfont, bfont, k, title_text = _style_parts(style, "slide", slide)
+    title = fit_block(title_text, tfont, max_w, int(avail * 0.55), int(title_start * k), int(40 * min(1, k)), 1.12)
     body_text = slide.text
-    body = fit_block(body_text, FONT_BODY, max_w, avail - title.height - 120, body_start, 28, 1.32)
+    body = fit_block(body_text, bfont, max_w, avail - title.height - 120, int(body_start * k),
+                     int(28 * min(1, k)), 1.32)
 
     extra = []  # (текст, шрифт, цвет) — бренд на последнем слайде
     if is_last and brand_name:
@@ -371,14 +395,21 @@ def render_slide(bg: Image.Image | None, slide: Slide, idx: int, total: int, kin
         y0 = area_bottom - block_h - pad - 40
     else:
         y0 = area_bottom - block_h - pad
+    if style is not None and style.pos == "top":
+        y0 = area_top + pad
+    elif style is not None and style.pos == "center":
+        y0 = (area_top + area_bottom - block_h) // 2
     y0 = max(area_top + pad, y0)
 
     LAST_LAYOUT.update(plate=(margin, y0 - pad, W - margin, y0 + block_h + pad), title_size=title.font.size,
                        body_size=body.font.size, lines=len(title.lines) + len(body.lines))
-    plate = Image.new("RGBA", size, (0, 0, 0, 0))
-    pd = ImageDraw.Draw(plate)
-    pd.rounded_rectangle((margin, y0 - pad, W - margin, y0 + block_h + pad), radius=36, fill=(10, 10, 14, 150))
-    img.alpha_composite(plate)
+    if fx is None or fx.plate:
+        import textstyle as _ts
+        plate = Image.new("RGBA", size, (0, 0, 0, 0))
+        pd = ImageDraw.Draw(plate)
+        pd.rounded_rectangle((margin, y0 - pad, W - margin, y0 + block_h + pad), radius=36,
+                             fill=(10, 10, 14, 150) if fx is None else _ts.plate_fill(fx))
+        img.alpha_composite(plate)
 
     d = ImageDraw.Draw(img)
     x = margin + pad
@@ -386,11 +417,19 @@ def render_slide(bg: Image.Image | None, slide: Slide, idx: int, total: int, kin
     d.rounded_rectangle((x, y, x + 120, y + bar_h), radius=5, fill=accent + (255,))
     y += bar_h + bar_gap
     for line in title.lines:
-        d.text((x, y), line, font=title.font, fill=(255, 255, 255, 255))
+        if fx is None:
+            d.text((x, y), line, font=title.font, fill=(255, 255, 255, 255))
+        else:
+            import textstyle as _ts
+            _ts.draw_line(img, (x, y), line, title.font, fx)
         y += title.line_h
     y += gap
     for line in body.lines:
-        d.text((x, y), line, font=body.font, fill=(232, 232, 236, 255))
+        if fx is None:
+            d.text((x, y), line, font=body.font, fill=(232, 232, 236, 255))
+        else:
+            import textstyle as _ts
+            _ts.draw_line(img, (x, y), line, body.font, fx)
         y += body.line_h
     if extra:
         y += 24
@@ -527,7 +566,7 @@ def _busy_score(img: Image.Image, box: tuple[int, int, int, int]) -> float:
 
 def render_overlay(photo: Image.Image, slide: Slide, idx: int, total: int, kind: str, brand_name: str = "",
                    accent: tuple[int, int, int] = (255, 213, 74), pos: str = "bottom",
-                   style: str = "gradient") -> Image.Image:
+                   style: str = "gradient", tstyle=None) -> Image.Image:
     """Фото → cover-crop до 1080×1080 / 1080×1920, затемнение ТОЛЬКО под текстом, текст, счётчик, бренд.
     Пиксели вне LAST_LAYOUT['touched'] совпадают с fit_cover(photo)."""
     size = CAROUSEL_SIZE if kind == "carousel" else STORY_SIZE
@@ -538,6 +577,8 @@ def render_overlay(photo: Image.Image, slide: Slide, idx: int, total: int, kind:
         margin, area_top, area_bottom = 70, 140, H - 120
     else:
         margin, area_top, area_bottom = 80, STORY_SAFE_TOP + 100, H - STORY_SAFE_BOTTOM - 30
+    if tstyle is not None and tstyle.pos:   # положение из стиля текста важнее общей настройки
+        pos = tstyle.pos
     if pos not in OVERLAY_POSITIONS:
         pos = "bottom"
     if pos == "auto":
@@ -546,12 +587,16 @@ def render_overlay(photo: Image.Image, slide: Slide, idx: int, total: int, kind:
         bot_s = _busy_score(img, (0, area_bottom - band, W, area_bottom))
         pos = "top" if top_s < bot_s * 0.8 else "bottom"
     style = style if style in OVERLAY_STYLES else "gradient"
+    fx, tfont, bfont, k, title_text = _style_parts(tstyle, "overlay", slide)
+    if tstyle is not None and tstyle.plate is not None:
+        style = "plate" if tstyle.plate else "gradient"
     pad = 36 if style == "plate" else 0
     max_w = W - 2 * margin - 2 * pad
     avail = (area_bottom - area_top) // (2 if kind == "carousel" else 3) + (60 if kind == "carousel" else 120)
-    title = fit_block(slide.title, FONT_TITLE, max_w, int(avail * 0.6), 80 if is_first else 64, 38, 1.12)
-    body = fit_block(slide.text, FONT_BODY, max_w, max(60, avail - title.height - 60),
-                     42 if kind == "carousel" else 46, 28, 1.3)
+    title = fit_block(title_text, tfont, max_w, int(avail * 0.6), int((80 if is_first else 64) * k),
+                      int(38 * min(1, k)), 1.12)
+    body = fit_block(slide.text, bfont, max_w, max(60, avail - title.height - 60),
+                     int((42 if kind == "carousel" else 46) * k), int(28 * min(1, k)), 1.3)
     extra = []
     if is_last and brand_name:
         extra.append((brand_name, _font(FONT_TITLE, 44 if kind == "carousel" else 52), accent))
@@ -571,7 +616,9 @@ def render_overlay(photo: Image.Image, slide: Slide, idx: int, total: int, kind:
 
     if style == "plate":
         box = (margin, y0 - pad, W - margin, y0 + block_h + pad)
-        ImageDraw.Draw(img, "RGBA").rounded_rectangle(box, radius=32, fill=(10, 10, 14, 165))
+        import textstyle as _ts
+        ImageDraw.Draw(img, "RGBA").rounded_rectangle(box, radius=32,
+                                                      fill=(10, 10, 14, 165) if fx is None else _ts.plate_fill(fx))
         touched.append(box)
     else:
         # полоса затемнения: плавный вход (fade) → плато под текстом; вне полосы фото не трогаем
@@ -606,20 +653,29 @@ def render_overlay(photo: Image.Image, slide: Slide, idx: int, total: int, kind:
     d.rounded_rectangle((x, y, x + 110, y + bar_h), radius=5, fill=accent)
     y += bar_h + bar_gap
     for line in title.lines:
-        d.text((x + 2, y + 3), line, font=title.font, fill=shadow)
-        d.text((x, y), line, font=title.font, fill=(255, 255, 255))
+        if fx is None:
+            d.text((x + 2, y + 3), line, font=title.font, fill=shadow)
+            d.text((x, y), line, font=title.font, fill=(255, 255, 255))
+        else:
+            import textstyle as _ts
+            _ts.draw_line(img, (x, y), line, title.font, fx)
         y += title.line_h
     y += gap
     for line in body.lines:
-        d.text((x + 2, y + 2), line, font=body.font, fill=shadow)
-        d.text((x, y), line, font=body.font, fill=(236, 236, 240))
+        if fx is None:
+            d.text((x + 2, y + 2), line, font=body.font, fill=shadow)
+            d.text((x, y), line, font=body.font, fill=(236, 236, 240))
+        else:
+            import textstyle as _ts
+            _ts.draw_line(img, (x, y), line, body.font, fx)
         y += body.line_h
     if extra:
         y += 20
         for t, f, colr in extra:
             d.text((x, y), t, font=f, fill=colr)
             y += int(f.size * 1.4)
-    touched.append(text_box)
+    touched.append(text_box if fx is None else
+                   (max(0, text_box[0] - 90), max(0, text_box[1] - 90), min(W, text_box[2] + 90), min(H, text_box[3] + 90)))
 
     def pill(right: int, top: int, text: str, font, fg=(255, 255, 255), bg=(0, 0, 0, 150), padx=(22, 12)):
         tw = int(font.getlength(text))

@@ -166,3 +166,16 @@ def list_refs(d: str) -> list[str]:
     # порядок загрузки: время записи, затем имя (ref_01…ref_10 / ref_<time_ns>)
     return sorted((os.path.join(d, f) for f in os.listdir(d) if f.endswith(".jpg")),
                   key=lambda p: (os.path.getmtime(p), os.path.basename(p)))
+
+
+def pack_for_api(paths: list[str], outdir: str, limit: int = API_MAX_REFS) -> list[str]:
+    """xAI /images/edits принимает до 5 картинок. Если фото больше — первые limit-1 идут как есть,
+    остальные склеиваются в одну коллаж-картинку (последний слот)."""
+    if len(paths) <= limit:
+        return list(paths)
+    head, rest = list(paths[:limit - 1]), paths[limit - 1:]
+    os.makedirs(outdir, exist_ok=True)
+    out = os.path.join(outdir, "collage.jpg")
+    with open(out, "wb") as f:
+        f.write(contact_sheet(rest, cell=512))
+    return head + [out]

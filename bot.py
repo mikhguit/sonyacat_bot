@@ -49,6 +49,7 @@ import insta
 import memes
 import refs
 import search
+import textstyle
 import users
 
 # ---------------------------------------------------------------------------
@@ -203,6 +204,9 @@ class Config:
     ref_vision: bool = True         # описывать стиль референсов через Grok vision
     ref_ttl_sec: float = 3600.0
     album_wait_sec: float = 1.2      # сколько ждать остальные фото альбома
+    # стиль текста на картинках / «Картинка по референсу» / «Надпись на картинке»
+    text_style_step: bool = True     # спрашивать «Стиль текста» в мастерах карусели/сторис/мема
+    refimg_resolution: str = "1k"    # разрешение новых картинок кнопок «по референсу» и «Надпись (Grok)»
     # поиск в вебе и X (серверные инструменты xAI)
     search_mode: str = "auto"        # auto — Grok сам решает, искать ли; off — без поиска (кроме /search)
     search_max_sources: int = 5
@@ -287,6 +291,8 @@ class Config:
             overlay_text_pos=(_env("OVERLAY_TEXT_POS") or "bottom").lower() if (_env("OVERLAY_TEXT_POS") or "bottom").lower() in insta.OVERLAY_POSITIONS else "bottom",
             overlay_style=(_env("OVERLAY_STYLE") or "gradient").lower() if (_env("OVERLAY_STYLE") or "gradient").lower() in insta.OVERLAY_STYLES else "gradient",
             ref_edit_quality=(_env("REF_EDIT_QUALITY") or "low").lower(),
+            text_style_step=_env("TEXT_STYLE_STEP").lower() not in ("0", "false", "no", "off", "нет"),
+            refimg_resolution=(_env("REFIMG_RESOLUTION") or "1k").lower() if (_env("REFIMG_RESOLUTION") or "1k").lower() in ("1k", "2k") else "1k",
             ref_vision=_env("REF_VISION").lower() not in ("0", "false", "no", "off", "нет"),
             search_mode="off" if (_env("SEARCH_MODE") or "auto").lower() in ("off", "0", "false", "no", "нет") else "auto",
             search_max_sources=max(0, min(10, int(_float("SEARCH_MAX_SOURCES", 5)))),
@@ -860,7 +866,8 @@ class XAIClient:
 # ---------------------------------------------------------------------------
 HELP = (
     "Привет! Я бот-посредник к Grok (xAI).\n\n"
-    "⬇️ Проще всего — кнопками меню внизу: Чат, Поиск, Картинка, Карусель, Сторис, Видео, Мем, Референсы, Баланс. "
+    "⬇️ Проще всего — кнопками меню внизу: Чат, Поиск, Картинка, Карусель, Сторис, Видео, Мем, Референсы, Баланс, "
+    "«Картинка по референсу», «Надпись на картинке», «Мой стиль текста». "
     "Бот сам спросит тему, количество и режим; «✖️ Отмена» или /cancel — выйти из мастера.\n\n"
     "Команды:\n"
     "/start — это сообщение\n"
@@ -877,6 +884,12 @@ HELP = (
     "/meme психология; /meme overlay [тема] — подпись на ваше фото; "
     "story — формат 9:16, число 1–5 — несколько мемов, /meme5 — сразу 5\n"
     "/memevideo [сек] <зверь> <ситуация> — короткое мем-видео 9:16\n"
+    "🖼 «Картинка по референсу» — пришлите 1–10 фото (или фото с подписью-описанием), опишите новую картинку: "
+    "Grok сделает её по вашим фото.\n"
+    "✍️ «Надпись на картинке» — загрузите картинку, введите текст (добавить / заменить / убрать) и выберите: "
+    "точно сохранить фото и нарисовать текст шрифтом локально или дать Grok нарисовать художественную надпись.\n"
+    "🔤 «Мой стиль текста» (/mystyle) — шрифт и цвет текста для каруселей, сторис и мемов: выбрать вручную, "
+    "готовый пресет или взять с картинки-референса; бот запомнит стиль.\n"
     "📎 Референсы: пришлите фото (или альбом) с подписью /carousel …, /story …, /meme … или ответьте командой на фото; "
     "просто фото без подписи сохраняются как референсы (/ref — посмотреть, /ref clear — удалить). "
     "Флаги: overlay — текст поверх ваших фото без изменений (1 фото = 1 слайд, до 10), "
@@ -914,9 +927,11 @@ ADMIN_HELP = (
 MENU_CHAT, MENU_SEARCH, MENU_IMG = "💬 Чат", "🔎 Поиск", "🎨 Картинка"
 MENU_CAROUSEL, MENU_STORY, MENU_VIDEO = "🖼 Карусель", "📱 Сторис", "🎬 Видео"
 MENU_MEME, MENU_REFS, MENU_BALANCE = "🐱 Мем", "📎 Референсы", "💰 Баланс"
+MENU_REFIMG, MENU_CAPTION = "🖼 Картинка по референсу", "✍️ Надпись на картинке"
+MENU_MYSTYLE = "🔤 Мой стиль текста"
 MENU_USERS = "👥 Пользователи"
 MENU_ROWS = ((MENU_CHAT, MENU_SEARCH, MENU_IMG), (MENU_CAROUSEL, MENU_STORY, MENU_VIDEO),
-             (MENU_MEME, MENU_REFS, MENU_BALANCE))
+             (MENU_MEME, MENU_REFS, MENU_BALANCE), (MENU_REFIMG, MENU_CAPTION), (MENU_MYSTYLE,))
 MENU_ALL = frozenset([b for r in MENU_ROWS for b in r] + [MENU_USERS])
 WIZ_CANCEL = "✖️ Отмена"
 
@@ -1047,6 +1062,9 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
     if user_store is None:
         user_store = users.UserStore(cfg.data_dir, cfg.access_request_cooldown_sec)
     dp["user_store"] = user_store  # для тестов/отладки
+    style_store = textstyle.StyleStore(cfg.data_dir)   # «Мой стиль текста» по пользователям
+    dp["style_store"] = style_store
+    style_once: dict[int, tuple[object, float]] = {}   # разовый выбор стиля мастером -> ближайший precheck
 
     def uid_allowed(uid: int | None) -> bool:
         """ALLOWED_USER_IDS ∪ ADMIN_USER_IDS (cfg.allowed_user_ids) ∪ добавленные командой/по заявке."""
@@ -1094,8 +1112,8 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
 
     # Фото обрабатываются раньше команд: подпись «/carousel …» у фото/альбома = команда с референсами.
     @dp.message(F.photo | F.document.mime_type.in_({"image/jpeg", "image/png", "image/webp"}))
-    async def on_photo_first(m: Message, bot: Bot) -> None:
-        await on_photo(m, bot)
+    async def on_photo_first(m: Message, bot: Bot, state: FSMContext) -> None:
+        await on_photo(m, bot, state)
 
     @dp.message(CommandStart())
     async def cmd_start(m: Message) -> None:
@@ -1701,7 +1719,18 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
     async def precheck_and_run(m: Message, bot: Bot, kind: str, params: dict, estimate: float) -> None:
         await precheck(bot, m.chat.id, m.from_user.id, kind, params, estimate)
 
+    def take_style(uid: int) -> textstyle.TextStyle | None:
+        """Стиль текста для запуска: разовый выбор мастера (на 2 минуты), иначе сохранённый «Мой стиль»."""
+        item = style_once.pop(uid, None)
+        if item and time.time() - item[1] < 120:
+            return None if item[0] == "default" else item[0]
+        return style_store.get(uid)
+
     async def precheck(bot: Bot, chat_id: int, user_id: int, kind: str, params: dict, estimate: float) -> None:
+        if kind in ("carousel", "story", "meme") and "tstyle" not in params:
+            ts = take_style(user_id)
+            if ts is not None:
+                params = {**params, "tstyle": ts.to_dict()}
         info, _ = await tracker.get()
         if info.usd is not None and estimate > info.usd:
             tok = secrets.token_hex(4)
@@ -1735,6 +1764,10 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                     await run_recap(bot, chat_id, **params)
                 elif kind == "memevideo":
                     await run_memevideo(bot, chat_id, **params)
+                elif kind == "refimg":
+                    await run_refimg(bot, chat_id, **params)
+                elif kind == "capai":
+                    await run_caption_ai(bot, chat_id, **params)
                 else:
                     await run_insta(bot, chat_id, kind, **params)
         except Exception:
@@ -1746,10 +1779,13 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
 
     async def run_insta(bot: Bot, chat_id: int, kind: str, topic: str, n: int, as_zip: bool,
                         ref_paths: list[str] | tuple = (), ref_mode: str | None = None, ref_source: str = "",
-                        overlay_pos: str | None = None, overlay_style: str | None = None) -> None:
+                        overlay_pos: str | None = None, overlay_style: str | None = None,
+                        tstyle: dict | None = None) -> None:
         if ref_mode == refs.MODE_OVERLAY:
-            await run_overlay(bot, chat_id, kind, topic, n, as_zip, ref_paths, ref_source, overlay_pos, overlay_style)
+            await run_overlay(bot, chat_id, kind, topic, n, as_zip, ref_paths, ref_source, overlay_pos, overlay_style,
+                              tstyle)
             return
+        tst = textstyle.from_dict(tstyle) if tstyle else None
         spend = Spend(bot)
         word = "слайд" if kind == "carousel" else "кадр"
         rc = {"paths": [p for p in ref_paths if os.path.exists(p)], "mode": ref_mode}
@@ -1801,7 +1837,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                     return
                 if bg is None:
                     fallbacks.append(i + 1)
-                out = insta.render_slide(bg, slide, i, n, kind, cfg.brand_name, accent)
+                out = insta.render_slide(bg, slide, i, n, kind, cfg.brand_name, accent, style=tst)
                 if bg is not None:
                     bg.close()
                 png = os.path.join(jdir, f"{kind}_{i + 1:02d}.png")
@@ -1856,9 +1892,10 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
 
     async def run_overlay(bot: Bot, chat_id: int, kind: str, topic: str, n: int, as_zip: bool,
                           ref_paths: list[str] | tuple, ref_source: str = "", pos: str | None = None,
-                          style: str | None = None) -> None:
+                          style: str | None = None, tstyle: dict | None = None) -> None:
         """Overlay: фото пользователя без перерисовки + текст. Один запрос к Grok (тексты + vision), без генерации картинок."""
         spend = Spend(bot)
+        tst = textstyle.from_dict(tstyle) if tstyle else None
         word = "слайд" if kind == "carousel" else "кадр"
         paths = [p for p in ref_paths if os.path.exists(p)][:cfg.ref_overlay_max]
         if not paths:
@@ -1897,7 +1934,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
 
                 def render_one(i=i, slide=slide) -> tuple[str, str]:
                     photo = insta.open_photo(paths[i], size)
-                    out = insta.render_overlay(photo, slide, i, n, kind, cfg.brand_name, accent, pos, style)
+                    out = insta.render_overlay(photo, slide, i, n, kind, cfg.brand_name, accent, pos, style, tstyle=tst)
                     photo.close()
                     png = os.path.join(jdir, f"{kind}_{i + 1:02d}.png")
                     jpg = os.path.join(jdir, f"{kind}_{i + 1:02d}.jpg")
@@ -2200,8 +2237,9 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                        meme_estimate(n, len(paths), mode))
 
     async def run_meme_overlay(bot: Bot, chat_id: int, user_id: int, topic: str, n: int, story: bool,
-                               paths: list[str], ref_source: str) -> None:
+                               paths: list[str], ref_source: str, tstyle: dict | None = None) -> None:
         """Мем поверх фото пользователя: фото без изменений (только crop), подпись от Grok по фото и теме."""
+        tst = textstyle.from_dict(tstyle) if tstyle else None
         spend = Spend(bot)
         paths = paths[:max(1, n)]
         n = len(paths)
@@ -2240,7 +2278,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
 
             def render_one(it=it) -> str:
                 photo = insta.open_photo(bg_path, size)
-                out = memes.render_meme(photo, it.top, it.bottom, story=story, watermark=cfg.brand_name, seed=seed)
+                out = memes.render_meme(photo, it.top, it.bottom, story=story, watermark=cfg.brand_name, seed=seed, style=tst)
                 photo.close()
                 png = os.path.join(jdir, "meme_1.png")
                 out.save(png)
@@ -2253,7 +2291,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             meme_jobs[jid] = {"dir": jdir, "png": png, "bg": bg_path, "seed": seed, "animal": "photo",
                               "topic": topic, "story": story, "scene": scene, "history": [it.label],
                               "created": time.time(), "user": user_id, "ver": 1, "ref_paths": [bg_path],
-                              "ref_mode": refs.MODE_OVERLAY, "ref_source": ref_source}
+                              "ref_mode": refs.MODE_OVERLAY, "ref_source": ref_source, "tstyle": tstyle}
             cap = f"🖼 Ваше фото{(' · ' + topic) if topic else ''}" + (f" · {i + 1}/{len(items)}" if len(items) > 1 else "")
             if cfg.show_cost and len(items) == 1:
                 cap += "\n\n" + spend.line("только текст, фото без изменений")
@@ -2264,13 +2302,15 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         await status_delete(status)
 
     async def run_meme(bot: Bot, chat_id: int, user_id: int, animal: str, topic: str, n: int, story: bool,
-                       ref_paths: list[str] | tuple = (), ref_mode: str | None = None, ref_source: str = "") -> None:
+                       ref_paths: list[str] | tuple = (), ref_mode: str | None = None, ref_source: str = "",
+                       tstyle: dict | None = None) -> None:
         if ref_mode == refs.MODE_OVERLAY:
             ps = [p for p in ref_paths if os.path.exists(p)]
             if ps:
-                await run_meme_overlay(bot, chat_id, user_id, topic, n, story, ps, ref_source)
+                await run_meme_overlay(bot, chat_id, user_id, topic, n, story, ps, ref_source, tstyle)
                 return
             ref_mode = None
+        tst = textstyle.from_dict(tstyle) if tstyle else None
         a = animal_by_key(animal)
         spend = Spend(bot)
         rc = {"paths": [p for p in ref_paths if os.path.exists(p)], "mode": ref_mode}
@@ -2331,7 +2371,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             seed = secrets.randbelow(1000)
             if bg is not None:
                 bg.save(bg_path, quality=93)
-            out = memes.render_meme(bg, it.top, it.bottom, story=story, watermark=cfg.brand_name, seed=seed)
+            out = memes.render_meme(bg, it.top, it.bottom, story=story, watermark=cfg.brand_name, seed=seed, style=tst)
             if bg is not None:
                 bg.close()
             png = os.path.join(jdir, "meme_1.png")
@@ -2342,7 +2382,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             meme_jobs[jid] = {"dir": jdir, "png": png, "bg": bg_path if os.path.exists(bg_path) else None,
                               "seed": seed, "animal": a.key, "topic": topic, "story": story, "scene": it.scene,
                               "history": [it.label], "created": time.time(), "user": user_id, "ver": 1,
-                              "ref_paths": rc["paths"], "ref_mode": rc["mode"], "ref_source": ref_source}
+                              "ref_paths": rc["paths"], "ref_mode": rc["mode"], "ref_source": ref_source, "tstyle": tstyle}
             done += 1
             note = "" if os.path.exists(bg_path) else "\n⚠️ Картинку получить не удалось — фон-заглушка."
             if rc.get("edit_failed") and i == 0:
@@ -2388,7 +2428,8 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         if j["bg"] and os.path.exists(j["bg"]):
             bg = Image.open(j["bg"])
             bg.load()
-        out = memes.render_meme(bg, it.top, it.bottom, story=j["story"], watermark=cfg.brand_name, seed=j["seed"])
+        out = memes.render_meme(bg, it.top, it.bottom, story=j["story"], watermark=cfg.brand_name, seed=j["seed"],
+                                style=textstyle.from_dict(j.get("tstyle")) if j.get("tstyle") else None)
         if bg is not None:
             bg.close()
         j["ver"] += 1
@@ -2565,9 +2606,10 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             await cq.answer("Делаю ещё один…")
             rp = [p for p in j.get("ref_paths") or [] if os.path.exists(p)]
             mode = j.get("ref_mode") if rp else None
+            tsx = {"tstyle": j.get("tstyle")} if (j.get("tstyle") or style_store.get(uid)) else {}
             await precheck(bot, chat_id, uid, "meme", {"animal": j["animal"], "topic": j["topic"], "n": 1,
                                                        "story": j["story"], "ref_paths": rp, "ref_mode": mode,
-                                                       "ref_source": j.get("ref_source", "")},
+                                                       "ref_source": j.get("ref_source", ""), **tsx},
                            meme_estimate(1, len(rp), mode))
         else:
             await cq.answer("Придумываю другую подпись…")
@@ -2578,7 +2620,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
     # ------------------------------------------------------------------
     PHOTO_COMMANDS = {"carousel", "story", "meme", "meme5", "img"}
 
-    async def on_photo(m: Message, bot: Bot) -> None:
+    async def on_photo(m: Message, bot: Bot, state: FSMContext | None = None) -> None:
         if not allowed(m):
             await deny(m)
             return
@@ -2586,11 +2628,12 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             key = (m.chat.id, m.media_group_id)
             buf = albums.setdefault(key, {"msgs": [], "task": None})
             buf["msgs"].append(m)
+            buf["state"] = state
             if buf["task"]:
                 buf["task"].cancel()
             buf["task"] = asyncio.create_task(flush_album(key, bot))
             return
-        await process_photos([m], bot)
+        await process_photos([m], bot, state)
 
     async def flush_album(key: tuple, bot: Bot) -> None:
         try:
@@ -2600,13 +2643,15 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         buf = albums.pop(key, None)
         if buf:
             try:
-                await process_photos(buf["msgs"], bot)
+                await process_photos(buf["msgs"], bot, buf.get("state"))
             except Exception:
                 log.exception("album processing failed")
 
-    async def process_photos(msgs: list[Message], bot: Bot) -> None:
+    async def process_photos(msgs: list[Message], bot: Bot, state: FSMContext | None = None) -> None:
         m = msgs[0]
         caption = next((x.caption for x in msgs if x.caption), "") or ""
+        if state is not None and not caption.strip().startswith("/") and await wizard_photos(msgs, bot, state):
+            return
         cm = re.match(r"^/([A-Za-z0-9_]+)(?:@\w+)?(?:\s+(.*))?$", caption.strip(), re.S)
         cmd = cm.group(1).lower() if cm else ""
         args = (cm.group(2) or "") if cm else ""
@@ -2821,6 +2866,22 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             await show_refs(m.chat.id, uid, bot)
             await m.answer(f"📎 Чтобы добавить фото — просто отправьте их сюда (можно альбомом, до "
                            f"{cfg.ref_store_max}). Режим выбирается кнопками выше.")
+        elif t == MENU_REFIMG:
+            tok = await wiz_new(state, "refimg", Wiz.text, step="photos", paths=[], dir=new_tmp_dir())
+            rows = [cancel_row(tok)]
+            if user_refs(uid):
+                rows.insert(0, [(f"📎 Взять мои сохранённые ({len(user_refs(uid))})", wcb(tok, "rf", "saved"))])
+            await m.answer("🖼 Картинка по референсу — шаг 1/2. Пришлите от 1 до 10 фото (можно альбомом) — Grok "
+                           "нарисует НОВУЮ картинку, опираясь на них: стиль, героев, предметы. Можно сразу написать "
+                           "описание в подписи к фото, например: «этот же кот, но в космосе». Иначе после фото "
+                           "напишите описание отдельным сообщением.", reply_markup=ikb(rows))
+        elif t == MENU_CAPTION:
+            tok = await wiz_new(state, "caption", Wiz.text, step="photo", dir=new_tmp_dir())
+            await m.answer("✍️ Надпись на картинке — шаг 1/4. Пришлите картинку (фото или файл JPG/PNG), на которую "
+                           "нужно добавить, заменить или убрать надпись. Текст можно сразу написать в подписи к фото.",
+                           reply_markup=ikb([cancel_row(tok)]))
+        elif t == MENU_MYSTYLE:
+            await show_mystyle(bot, m.chat.id, uid)
         elif t == MENU_BALANCE:
             await cmd_balance(m, bot)
         elif t == MENU_USERS:
@@ -2889,6 +2950,760 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         except TelegramBadRequest:
             await bot.send_document(chat_id, BufferedInputFile(img, filename=f"grok.{ext}"), caption=caption)
 
+    async def insta_launch(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict, paths: list[str],
+                           src: str, mode: str | None) -> None:
+        """Запуск карусели/сторис из мастера; перед ним — шаг «Стиль текста» (если включён TEXT_STYLE_STEP)."""
+        if cfg.text_style_step:
+            d["go"] = {"paths": list(paths), "src": src, "mode": mode}
+            await style_begin(bot, chat_id, uid, state, d)
+            return
+        await state.clear()
+        await launch_insta(bot, chat_id, uid, d["wiz"], d["topic"], d["n"], False, paths, src, mode)
+
+    async def meme_launch_now(bot: Bot, chat_id: int, uid: int, d: dict, n: int) -> None:
+        src = d.get("src", "animal")
+        paths = user_refs(uid) if src in ("edit", "overlay") else []
+        mode = {"edit": refs.MODE_EDIT, "overlay": refs.MODE_OVERLAY}.get(src) if paths else None
+        animal = d.get("animal") or memes.random.choice(animals).key
+        if animal == "photo" and not paths:
+            animal = memes.random.choice(animals).key
+        await launch_meme(bot, chat_id, uid, animal, d.get("topic", ""), n, bool(d.get("story")),
+                          paths, "сохранённые" if paths else "", mode)
+
+    # ------------------------------------------------------------------
+    # «Стиль текста»: шаг мастеров каруселей/сторис/мемов/надписей и «Мой стиль текста»
+    # ------------------------------------------------------------------
+    wiz_locks: dict[int, asyncio.Lock] = defaultdict(asyncio.Lock)
+    STY_MODE = {"carousel": "overlay", "story": "overlay", "meme": "meme", "caption": "caption", "mystyle": "overlay"}
+    FONT_LBL = {k: v.label for k, v in textstyle.FONTS.items()}
+
+    def cur_style(d: dict) -> textstyle.TextStyle:
+        return textstyle.from_dict(d.get("sty"))
+
+    def kb_rows(btns: list[tuple[str, str]], per: int = 2) -> list[list[tuple[str, str]]]:
+        return [btns[i:i + per] for i in range(0, len(btns), per)]
+
+    async def send_style_preview(bot: Bot, chat_id: int, st: textstyle.TextStyle, mode: str, caption: str,
+                                 kb: InlineKeyboardMarkup | None) -> None:
+        caption = caption[:1020]
+        try:
+            data = await asyncio.to_thread(textstyle.render_preview, textstyle.materialize(st, mode))
+            await bot.send_photo(chat_id, BufferedInputFile(data, filename="style.jpg"), caption=caption,
+                                 reply_markup=kb)
+        except Exception as e:  # noqa: BLE001 — превью не должно ломать мастер
+            log.warning("превью стиля не построено: %s", e)
+            await bot.send_message(chat_id, caption, reply_markup=kb)
+
+    async def style_begin(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict) -> None:
+        wiz, tok = d["wiz"], d["tok"]
+        d.update(step="sty_menu", sty={})
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        saved = style_store.get(uid)
+        rows: list[list[tuple[str, str]]] = []
+        if saved and wiz != "mystyle":
+            rows.append([(f"⭐ Мой стиль ({textstyle.FONTS[saved.font].label})", wcb(tok, "ty", "my"))])
+        if wiz != "mystyle":
+            rows.append([("По умолчанию", wcb(tok, "ty", "def"))])
+        rows += [[("🎨 Готовые стили", wcb(tok, "ty", "pre"))],
+                 [("🎛 Выбрать вручную", wcb(tok, "ty", "man"))],
+                 [("📷 Взять с референса", wcb(tok, "ty", "ref"))], cancel_row(tok)]
+        what = {"caption": "надписи", "meme": "подписей мема"}.get(wiz, "слайдов")
+        await bot.send_message(chat_id, f"🔤 Стиль текста для {what}. Как оформить?\n"
+                                        "• по умолчанию — как раньше;\n• готовые стили или ручной выбор шрифта, цвета, "
+                                        "эффектов;\n• «взять с референса» — пришлите картинку с нужной надписью, я "
+                                        "повторю стиль ближайшими шрифтами.", reply_markup=ikb(rows))
+
+    def fx_kb(tok: str, st: textstyle.TextStyle, mode: str, with_grad: bool) -> InlineKeyboardMarkup:
+        fx = textstyle.resolve(st, mode)
+        btns = []
+        for k, lbl in textstyle.EFFECTS:
+            if k == "gradient" and not with_grad:
+                continue
+            btns.append((("✅ " if getattr(fx, k) else "⬜ ") + lbl, wcb(tok, "ty", "e:" + k)))
+        return ikb(kb_rows(btns) + [[("➡️ Дальше", wcb(tok, "ty", "e:ok"))], cancel_row(tok)])
+
+    async def sty_step_font(bot: Bot, chat_id: int, state: FSMContext, d: dict) -> None:
+        tok = d["tok"]
+        d["step"] = "sty_font"
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        btns = [(textstyle.FONTS[k].label, wcb(tok, "ty", "f:" + k)) for k in textstyle.FONT_KEYS]
+        try:
+            await bot.send_photo(chat_id, BufferedInputFile(textstyle.render_font_sheet(), filename="fonts.jpg"),
+                                 caption="Шрифты (все с кириллицей). Выберите шрифт:",
+                                 reply_markup=ikb(kb_rows(btns) + [cancel_row(tok)]))
+        except TelegramBadRequest:
+            await bot.send_message(chat_id, "Выберите шрифт:", reply_markup=ikb(kb_rows(btns) + [cancel_row(tok)]))
+
+    async def sty_step_color(bot: Bot, chat_id: int, state: FSMContext, d: dict) -> None:
+        tok = d["tok"]
+        d["step"] = "sty_color"
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        btns = [(lbl, wcb(tok, "ty", "c:" + k)) for k, lbl, _, _ in textstyle.PALETTE]
+        rows = kb_rows(btns, 3) + [[("🎯 Свой HEX", wcb(tok, "ty", "c:hex")), ("Белый по умолчанию", wcb(tok, "ty", "c:none"))],
+                                   cancel_row(tok)]
+        await bot.send_message(chat_id, "Цвет текста:", reply_markup=ikb(rows))
+
+    async def sty_step_fx(bot: Bot, chat_id: int, state: FSMContext, d: dict) -> None:
+        d["step"] = "sty_fx"
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        mode = STY_MODE[d["wiz"]]
+        await bot.send_message(chat_id, "Эффекты — нажимайте, чтобы включить/выключить (✅ — включено), затем «Дальше»:",
+                               reply_markup=fx_kb(d["tok"], cur_style(d), mode, d["wiz"] == "caption"))
+
+    async def sty_step_choice(bot: Bot, chat_id: int, state: FSMContext, d: dict, step: str) -> None:
+        tok = d["tok"]
+        d["step"] = step
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        if step == "sty_case":
+            btns = [(v, wcb(tok, "ty", "k:" + k)) for k, v in textstyle.CASES.items()] + [("Как написано", wcb(tok, "ty", "k:none"))]
+            await bot.send_message(chat_id, "Регистр букв:", reply_markup=ikb(kb_rows(btns) + [cancel_row(tok)]))
+        elif step == "sty_pos":
+            btns = [(v.capitalize(), wcb(tok, "ty", "o:" + k)) for k, v in textstyle.POSITIONS.items()] + [
+                ("Как обычно", wcb(tok, "ty", "o:none"))]
+            await bot.send_message(chat_id, "Где разместить текст?", reply_markup=ikb(kb_rows(btns) + [cancel_row(tok)]))
+        elif step == "sty_size":
+            btns = [(v[0], wcb(tok, "ty", "z:" + k)) for k, v in textstyle.SIZES.items()]
+            await bot.send_message(chat_id, "Размер текста:", reply_markup=ikb(kb_rows(btns, 3) + [cancel_row(tok)]))
+        elif step == "sty_space":
+            btns = [("Обычные буквы", wcb(tok, "ty", "g:0")), ("Чуть шире", wcb(tok, "ty", "g:6")),
+                    ("Разрежённые", wcb(tok, "ty", "g:12"))]
+            await bot.send_message(chat_id, "Расстояние между буквами:", reply_markup=ikb(kb_rows(btns, 3) + [cancel_row(tok)]))
+
+    async def style_confirm(bot: Bot, chat_id: int, state: FSMContext, d: dict, st: textstyle.TextStyle,
+                            head: str, data: dict | None = None, extra: str = "") -> None:
+        tok = d["tok"]
+        d.update(step="sty_confirm", sty_cand=st.to_dict())
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        mode = STY_MODE[d["wiz"]]
+        cap = f"{head}\n{textstyle.style_summary_ru(st, data, mode)}" + (("\n" + extra) if extra else "")
+        cap += "\n\n«Применить» — использую и запомню как «Мой стиль»."
+        await send_style_preview(bot, chat_id, st, mode, cap, ikb([
+            [("✅ Применить", wcb(tok, "ty", "ok")), ("✏️ Изменить", wcb(tok, "ty", "ed"))], cancel_row(tok)]))
+
+    async def style_finish(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict,
+                           st: textstyle.TextStyle | None) -> None:
+        wiz = d["wiz"]
+        if wiz == "mystyle":
+            await state.clear()
+            await show_mystyle(bot, chat_id, uid, "✅ Стиль сохранён.")
+            return
+        if wiz == "caption":
+            await caption_local(bot, chat_id, uid, state, d, st or textstyle.TextStyle())
+            return
+        style_once[uid] = (st if st is not None else "default", time.time())
+        go = d.get("go") or {}
+        await state.clear()
+        if wiz in ("carousel", "story"):
+            await launch_insta(bot, chat_id, uid, wiz, d["topic"], d["n"], False, go.get("paths", []),
+                               go.get("src", ""), go.get("mode"))
+        elif wiz == "meme":
+            await meme_launch_now(bot, chat_id, uid, d, int(go.get("n", 1)))
+
+    async def analyze_style_ref(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict, path: str) -> None:
+        spend = Spend(bot)
+        status = await bot.send_message(chat_id, "🔍 Смотрю на надпись и подбираю шрифт…")
+        try:
+            uri = await asyncio.to_thread(refs.data_uri, path, 1280)
+            async with ChatActionSender.typing(bot=bot, chat_id=chat_id):
+                data, cost = await xai.chat_json(textstyle.vision_messages(uri), textstyle.vision_schema(),
+                                                 name=textstyle.VISION_NAME)
+            await spend.add(cost)
+        except XAIError as e:
+            log.error("style vision error: %s", e)
+            await spend.add(e.cost)
+            await status_edit(status, error_text(e) + "\n\nПришлите другую картинку или выберите стиль кнопками."
+                              + ("\n" + spend.line() if spend.usd else ""))
+            return
+        except Exception as e:  # noqa: BLE001
+            log.error("style vision failed: %s", e)
+            await status_edit(status, "😕 Не удалось прочитать картинку. Пришлите JPG/PNG.")
+            return
+        st, notes = textstyle.style_from_json(data)
+        await status_delete(status)
+        extra = ("⚠️ " + "; ".join(notes) + "\n" if notes else "") + (spend.line("разбор референса") if cfg.show_cost else "")
+        head = "Понял стиль так:" if data.get("has_text", True) else "На картинке нет надписи — подобрал подходящий стиль:"
+        await style_confirm(bot, chat_id, state, d, st, head, data, extra.strip())
+
+    async def style_button(cq: CallbackQuery, bot: Bot, state: FSMContext, d: dict, val: str) -> None:
+        tok, wiz = d["tok"], d["wiz"]
+        uid = cq.from_user.id
+        chat_id = cq.message.chat.id if cq.message else uid
+        if not str(d.get("step", "")).startswith("sty_"):
+            await bot.send_message(chat_id, "Этот шаг уже неактуален — начните заново кнопкой меню.")
+            return
+        mode = STY_MODE[wiz]
+        kind, _, arg = val.partition(":")
+        sty = d.get("sty") or {}
+        if kind == "def":
+            await style_finish(bot, chat_id, uid, state, d, None)
+        elif kind == "my":
+            saved = style_store.get(uid)
+            if saved:
+                await style_finish(bot, chat_id, uid, state, d, saved)
+            else:
+                await style_begin(bot, chat_id, uid, state, d)
+        elif kind == "pre":
+            d["step"] = "sty_pre"
+            await state.set_data(d)
+            btns = [(lbl, wcb(tok, "ty", "p:" + k)) for k, (lbl, _) in textstyle.PRESETS.items()]
+            await bot.send_message(chat_id, "Готовые стили:", reply_markup=ikb(
+                kb_rows(btns) + [[("↩️ Назад", wcb(tok, "ty", "back"))], cancel_row(tok)]))
+        elif kind == "back":
+            await style_begin(bot, chat_id, uid, state, d)
+        elif kind == "p":
+            st = textstyle.preset(arg)
+            if st is None:
+                raise ValueError(arg)
+            await style_confirm(bot, chat_id, state, d, st, f"Стиль «{textstyle.PRESETS[arg][0]}»:")
+        elif kind == "man":
+            d["sty"] = {}
+            await sty_step_font(bot, chat_id, state, d)
+        elif kind == "ed":
+            d["sty"] = dict(d.get("sty_cand") or {})
+            await sty_step_font(bot, chat_id, state, d)
+        elif kind == "f" and arg in textstyle.FONTS:
+            sty["font"] = arg
+            d["sty"] = sty
+            await sty_step_color(bot, chat_id, state, d)
+        elif kind == "c":
+            if arg == "hex":
+                d["step"] = "sty_hex"
+                await state.set_state(Wiz.text)
+                await state.set_data(d)
+                await bot.send_message(chat_id, "Введите цвет в формате HEX, например #FF8800 или FF8800:",
+                                       reply_markup=ikb([cancel_row(tok)]))
+                return
+            if arg == "none":
+                sty.pop("color", None)
+            elif arg in textstyle.PALETTE_HEX:
+                sty["color"] = textstyle.PALETTE_HEX[arg]
+            else:
+                raise ValueError(arg)
+            d["sty"] = sty
+            await sty_step_fx(bot, chat_id, state, d)
+        elif kind == "e":
+            st = cur_style(d)
+            if arg == "ok":
+                await sty_step_choice(bot, chat_id, state, d, "sty_case")
+                return
+            if arg not in dict(textstyle.EFFECTS):
+                raise ValueError(arg)
+            now = getattr(textstyle.resolve(st, mode), arg)
+            sty[arg] = not now
+            d["sty"] = sty
+            await state.set_data(d)
+            if cq.message:
+                try:
+                    await cq.message.edit_reply_markup(reply_markup=fx_kb(tok, cur_style(d), mode, wiz == "caption"))
+                except TelegramBadRequest:
+                    pass
+        elif kind == "k":
+            if arg in textstyle.CASES:
+                sty["case"] = arg
+            else:
+                sty.pop("case", None)
+            d["sty"] = sty
+            await sty_step_choice(bot, chat_id, state, d, "sty_size" if wiz == "meme" else "sty_pos")
+        elif kind == "o":
+            if arg in textstyle.POSITIONS:
+                sty["pos"] = arg
+            else:
+                sty.pop("pos", None)
+            d["sty"] = sty
+            await sty_step_choice(bot, chat_id, state, d, "sty_size")
+        elif kind == "z" and arg in textstyle.SIZES:
+            sty["size"] = arg
+            d["sty"] = sty
+            await sty_step_choice(bot, chat_id, state, d, "sty_space")
+        elif kind == "g":
+            sty["spacing"] = max(0, min(30, int(arg)))
+            d["sty"] = sty
+            await style_confirm(bot, chat_id, state, d, cur_style(d), "Ваш стиль:")
+        elif kind == "ref":
+            d["step"] = "sty_ref"
+            await state.set_state(Wiz.text)
+            await state.set_data(d)
+            await bot.send_message(chat_id, "📷 Пришлите картинку, где есть нужная надпись (фото или файл JPG/PNG). "
+                                            "Содержание картинки не важно — смотрю только на стиль текста.",
+                                   reply_markup=ikb([cancel_row(tok)]))
+        elif kind == "ok":
+            st = textstyle.from_dict(d.get("sty_cand"))
+            ok = style_store.set(uid, st)
+            msg = "✅ Применено и сохранено как «Мой стиль»."
+            if not ok:
+                msg += "\n⚠️ Не удалось записать файл — стиль будет жить до перезапуска бота (код: /mystyle)."
+            await bot.send_message(chat_id, msg)
+            await style_finish(bot, chat_id, uid, state, d, st)
+        else:
+            raise ValueError(val)
+
+    async def show_mystyle(bot: Bot, chat_id: int, uid: int, head: str = "") -> None:
+        st = style_store.get(uid)
+        if not st:
+            await bot.send_message(
+                chat_id, (head + "\n" if head else "") + "🔤 «Мой стиль текста» пока не задан. Он нужен для каруселей, "
+                "сторис и мемов (и надписей на картинках): шрифт, цвет, эффекты — один раз, дальше применяется сам.\n"
+                "Можно задать вручную, выбрать готовый стиль или взять с картинки-референса.",
+                reply_markup=ikb([[("➕ Задать стиль", "ms:new")]]))
+            return
+        cap = ((head + "\n") if head else "") + "🔤 Мой стиль текста:\n" + textstyle.describe(st, "overlay")
+        cap += ("\n\nПрименяется автоматически в /carousel, /story, /meme и в мастерах (в шаге «Стиль текста» можно "
+                "выбрать «По умолчанию» на один раз).")
+        if not style_store.persist_ok:
+            cap += "\n⚠️ Файл со стилями недоступен для записи — стиль живёт до перезапуска."
+        await send_style_preview(bot, chat_id, st, "overlay", cap, ikb([
+            [("✏️ Изменить", "ms:edit"), ("🗑 Сбросить", "ms:reset")], [("📋 Код для восстановления", "ms:code")]]))
+
+    @dp.message(Command("mystyle"))
+    async def cmd_mystyle(m: Message, command: CommandObject, bot: Bot) -> None:
+        if not allowed(m):
+            await deny(m)
+            return
+        uid = m.from_user.id
+        arg = (command.args or "").strip()
+        if arg.lower() in ("reset", "сброс", "clear"):
+            had = style_store.reset(uid)
+            await m.answer("🗑 Стиль сброшен — текст снова оформляется по умолчанию." if had else "Стиль и не был задан.")
+            return
+        if arg:
+            st = textstyle.import_code(arg)
+            if st is None:
+                await m.answer("Не разобрал код. Он выглядит как {\"font\":\"lobster\",\"color\":\"#E8C872\",…} — "
+                               "его выдаёт кнопка «📋 Код для восстановления» в /mystyle.")
+                return
+            style_store.set(uid, st)
+            await show_mystyle(bot, m.chat.id, uid, "✅ Стиль восстановлен из кода.")
+            return
+        await show_mystyle(bot, m.chat.id, uid)
+
+    @dp.callback_query(F.data.regexp(r"^ms:(new|edit|reset|code)$"))
+    async def on_mystyle_button(cq: CallbackQuery, bot: Bot, state: FSMContext) -> None:
+        if not cq.from_user or not uid_allowed(cq.from_user.id):
+            await cq.answer("Нет доступа", show_alert=True)
+            return
+        uid = cq.from_user.id
+        chat_id = cq.message.chat.id if cq.message else uid
+        act = cq.data.split(":")[1]
+        await cq.answer()
+        if act in ("new", "edit"):
+            await wiz_new(state, "mystyle", Wiz.choose, step="sty_menu")
+            await style_begin(bot, chat_id, uid, state, await state.get_data())
+        elif act == "reset":
+            style_store.reset(uid)
+            await bot.send_message(chat_id, "🗑 Стиль сброшен — текст снова оформляется по умолчанию.")
+        else:
+            st = style_store.get(uid)
+            if not st:
+                await bot.send_message(chat_id, "Стиль не задан.")
+                return
+            await bot.send_message(
+                chat_id, "📋 Код вашего стиля. На бесплатном хостинге файлы стираются при перезапуске бота — сохраните "
+                         "его, а потом отправьте команду /mystyle и этот код.\n<code>"
+                         + html.escape(textstyle.export_code(st)) + "</code>", parse_mode="HTML")
+
+    # ------------------------------------------------------------------
+    # 🖼 Картинка по референсу
+    # ------------------------------------------------------------------
+    REFIMG_MAX = 10
+
+    def refimg_estimate(k: int) -> float:
+        return (cfg.image_price(cfg.refimg_resolution, cfg.ref_edit_quality)
+                + min(k, refs.API_MAX_REFS) * cfg.price_image_input)
+
+    async def refimg_aspect_step(bot: Bot, chat_id: int, state: FSMContext, d: dict) -> None:
+        tok = d["tok"]
+        d["step"] = "aspect"
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        k = len(d["paths"])
+        note = (f"\nℹ️ Grok принимает до {refs.API_MAX_REFS} исходных картинок: первые {refs.API_MAX_REFS - 1} пойдут "
+                f"как есть, остальные — одним коллажем." if k > refs.API_MAX_REFS else "")
+        await bot.send_message(
+            chat_id, f"Шаг 2/2. Фото: {k}. Формат новой картинки? (≈{fmt_cost(refimg_estimate(k))}){note}",
+            reply_markup=ikb([[("📐 Как на фото", wcb(tok, "rf", "a:auto")), ("🟦 1:1", wcb(tok, "rf", "a:1:1"))],
+                              [("📱 9:16", wcb(tok, "rf", "a:9:16")), ("🖥 16:9", wcb(tok, "rf", "a:16:9")),
+                               ("3:4", wcb(tok, "rf", "a:3:4"))], cancel_row(tok)]))
+
+    async def run_refimg(bot: Bot, chat_id: int, paths: list[str], prompt: str, aspect: str = "auto") -> None:
+        spend = Spend(bot)
+        ps = [p for p in paths if os.path.exists(p)]
+        if not ps:
+            await bot.send_message(chat_id, "📎 Фото не найдены (хранятся ограниченное время). Начните заново: "
+                                            "«🖼 Картинка по референсу».")
+            return
+        status = await bot.send_message(chat_id, f"🖼 Генерирую по {len(ps)} фото… "
+                                                 f"(оценка ≈{fmt_cost(refimg_estimate(len(ps)))})")
+        try:
+            api = await asyncio.to_thread(refs.pack_for_api, ps, new_tmp_dir())
+            ar = (None if len(api) == 1 else "auto") if aspect == "auto" else aspect
+            async with ChatActionSender(bot=bot, chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO):
+                img, mime, cost = await xai.image_edit(refs.edit_prompt(prompt, len(api)), api, ar,
+                                                       cfg.refimg_resolution, cfg.ref_edit_quality)
+            await spend.add(cost)
+        except XAIError as e:
+            log.error("refimg error: %s", e)
+            await spend.add(e.cost)
+            await status_edit(status, error_text(e) + ("\n\n" + spend.line() if spend.usd else ""))
+            return
+        await status_delete(status)
+        ext = {"image/png": "png", "image/webp": "webp"}.get(mime.split(";")[0], "jpg")
+        tail = ("\n\n" + spend.line(f"по {len(ps)} фото")) if cfg.show_cost else ""
+        caption = ("🖼 " + prompt)[: 1024 - len(tail)] + tail
+        try:
+            await bot.send_photo(chat_id, BufferedInputFile(img, filename=f"refimg.{ext}"), caption=caption)
+        except TelegramBadRequest:
+            await bot.send_document(chat_id, BufferedInputFile(img, filename=f"refimg.{ext}"), caption=caption)
+
+    # ------------------------------------------------------------------
+    # ✍️ Надпись на картинке
+    # ------------------------------------------------------------------
+    def caption_ai_estimate(n_src: int) -> float:
+        return cfg.image_price(cfg.refimg_resolution, cfg.ref_edit_quality) + n_src * cfg.price_image_input
+
+    async def caption_method_step(bot: Bot, chat_id: int, state: FSMContext, d: dict) -> None:
+        tok = d["tok"]
+        d["step"] = "method"
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        rows = []
+        if d.get("mode") == "add":
+            rows.append([("📌 Точно сохранить фото (бесплатно)", wcb(tok, "ca", "m:local"))])
+        rows.append([(f"🎨 Нарисует Grok (≈{fmt_cost(caption_ai_estimate(1))})", wcb(tok, "ca", "m:ai"))])
+        note = ("• «Точно сохранить фото» — картинка остаётся пиксель-в-пиксель, текст рисую я выбранным шрифтом.\n"
+                if d.get("mode") == "add" else
+                "• Заменить текст точно, не затронув остальное, можно только через Grok (локально старую надпись не стереть).\n")
+        await bot.send_message(chat_id, "Как сделать надпись?\n" + note +
+                               "• «Нарисует Grok» — художественная надпись (неон, золото, граффити…), но Grok "
+                               "перерисовывает картинку и иногда ошибается в буквах.", reply_markup=ikb(rows + [cancel_row(tok)]))
+
+    async def caption_ai_style_step(bot: Bot, chat_id: int, state: FSMContext, d: dict) -> None:
+        tok = d["tok"]
+        d["step"] = "ai_style"
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        btns = [(lbl, wcb(tok, "ca", "s:" + k)) for k, (lbl, _) in textstyle.AI_STYLES.items()]
+        rows = kb_rows(btns) + [[("✏️ Опишу сам", wcb(tok, "ca", "s:custom")),
+                                 ("📷 Как на референсе", wcb(tok, "ca", "s:ref"))], cancel_row(tok)]
+        await bot.send_message(chat_id, "Стиль художественной надписи:", reply_markup=ikb(rows))
+
+    async def caption_ai_color_step(bot: Bot, chat_id: int, state: FSMContext, d: dict) -> None:
+        tok = d["tok"]
+        d["step"] = "ai_color"
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        btns = [(lbl, wcb(tok, "ca", "c:" + k)) for k, lbl in textstyle.AI_COLORS]
+        await bot.send_message(chat_id, "Цвет букв:", reply_markup=ikb(kb_rows(btns, 3) + [cancel_row(tok)]))
+
+    async def caption_ai_pos_step(bot: Bot, chat_id: int, state: FSMContext, d: dict) -> None:
+        tok = d["tok"]
+        d["step"] = "ai_pos"
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        keys = list(textstyle.AI_POS) if d.get("mode") == "replace" else ["top", "center", "bottom"]
+        btns = [(textstyle.AI_POS[k].capitalize(), wcb(tok, "ca", "p:" + k)) for k in keys]
+        await bot.send_message(chat_id, "Где разместить надпись?", reply_markup=ikb(kb_rows(btns, 2) + [cancel_row(tok)]))
+
+    async def caption_ai_launch(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict) -> None:
+        mode = d.get("mode", "add")
+        ref_style = d.get("ref_style")
+        params = {"src": d["src"], "mode": mode, "text": d.get("text", ""), "style_desc": d.get("ai_desc", ""),
+                  "color": d.get("ai_color", "auto"), "pos": d.get("ai_pos", "bottom"),
+                  "ref_style": ref_style if ref_style and mode != "remove" else None}
+        await state.clear()
+        await precheck(bot, chat_id, uid, "capai", params, caption_ai_estimate(2 if params["ref_style"] else 1))
+
+    async def run_caption_ai(bot: Bot, chat_id: int, src: str, mode: str, text: str = "", style_desc: str = "",
+                             color: str = "auto", pos: str = "bottom", ref_style: str | None = None) -> None:
+        spend = Spend(bot)
+        files = [p for p in (src, ref_style) if p and os.path.exists(p)]
+        if not files or files[0] != src:
+            await bot.send_message(chat_id, "📎 Картинка не найдена (хранится ограниченное время). Начните заново: "
+                                            "«✍️ Надпись на картинке».")
+            return
+        prompt = textstyle.ai_caption_prompt(mode, text, style_desc, color, pos, with_style_ref=len(files) > 1)
+        word = {"add": "рисует надпись", "replace": "заменяет надпись", "remove": "убирает надпись"}[mode]
+        status = await bot.send_message(chat_id, f"🎨 Grok {word}… (оценка ≈{fmt_cost(caption_ai_estimate(len(files)))})")
+        try:
+            async with ChatActionSender(bot=bot, chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO):
+                img, mime, cost = await xai.image_edit(prompt, files, None if len(files) == 1 else "auto",
+                                                       cfg.refimg_resolution, cfg.ref_edit_quality)
+            await spend.add(cost)
+        except XAIError as e:
+            log.error("caption-ai error: %s", e)
+            await spend.add(e.cost)
+            await status_edit(status, error_text(e) + ("\n\n" + spend.line() if spend.usd else ""))
+            return
+        await status_delete(status)
+        ext = {"image/png": "png", "image/webp": "webp"}.get(mime.split(";")[0], "jpg")
+        head = {"add": f"✍️ «{text}»", "replace": f"🔁 «{text}»", "remove": "🧽 Надпись убрана"}[mode]
+        hint = "\n⚠️ Grok мог ошибиться в буквах. Нужна точность — «Точно сохранить фото»." if mode != "remove" else ""
+        tail = ("\n\n" + spend.line("Grok")) if cfg.show_cost else ""
+        caption = (head + hint)[: 1024 - len(tail)] + tail
+        try:
+            await bot.send_photo(chat_id, BufferedInputFile(img, filename=f"caption.{ext}"), caption=caption)
+        except TelegramBadRequest:
+            await bot.send_document(chat_id, BufferedInputFile(img, filename=f"caption.{ext}"), caption=caption)
+
+    async def caption_local(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict,
+                            st: textstyle.TextStyle) -> None:
+        tok = d["tok"]
+        src, text = d.get("src"), d.get("text", "")
+        if not src or not os.path.exists(src) or not text:
+            await state.clear()
+            await bot.send_message(chat_id, "📎 Картинка не найдена (хранится ограниченное время). Начните заново: "
+                                            "«✍️ Надпись на картинке».")
+            return
+        outdir = os.path.dirname(src)
+
+        def render() -> tuple[str, str, str]:
+            with Image.open(src) as im:
+                im.load()
+                out = textstyle.render_caption(im, text, st)
+            png, jpg = os.path.join(outdir, "caption.png"), os.path.join(outdir, "caption.jpg")
+            out.save(png)
+            out.convert("RGB").save(jpg, quality=93)
+            out.close()
+            return png, jpg, textstyle.LAST_CAPTION.get("dropped", "")
+
+        try:
+            async with ChatActionSender(bot=bot, chat_id=chat_id, action=ChatAction.UPLOAD_PHOTO):
+                png, jpg, dropped = await asyncio.to_thread(render)
+        except Exception as e:  # noqa: BLE001
+            log.error("caption render error: %s", e)
+            await state.clear()
+            await bot.send_message(chat_id, "😕 Не получилось нарисовать надпись. Попробуйте другую картинку.")
+            return
+        release_memory()
+        d.update(step="after", cap_style=st.to_dict())
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        cap = f"✍️ «{text}» · {textstyle.FONTS[st.font].label}" + ("\n\n💰 Бесплатно: фото не менялось, текст нарисован локально."
+                                                                 if cfg.show_cost else "")
+        if dropped:
+            cap += f"\n⚠️ Символы {dropped} в этом шрифте не нарисовать — убрал."
+        kb = ikb([[("🎨 Другой стиль", wcb(tok, "ca", "re")), ("✅ Готово", wcb(tok, "ca", "done"))]])
+        try:
+            await bot.send_photo(chat_id, FSInputFile(jpg), caption=cap[:1020], reply_markup=kb)
+        except TelegramBadRequest:
+            await bot.send_message(chat_id, cap[:1020], reply_markup=kb)
+        await bot.send_document(chat_id, FSInputFile(png, filename="caption.png"), caption="Файл без сжатия (PNG)")
+
+    # ------------------------------------------------------------------
+    # Фото внутри мастеров
+    # ------------------------------------------------------------------
+    def wiz_expects_photo(d: dict) -> bool:
+        wiz, step = d.get("wiz"), d.get("step")
+        return bool((wiz == "refimg" and step == "photos") or (wiz == "caption" and step in ("photo", "ai_ref"))
+                    or step == "sty_ref")
+
+    async def wizard_photos(msgs: list[Message], bot: Bot, state: FSMContext) -> bool:
+        """Фото, пришедшее посреди мастера. True — фото обработано мастером."""
+        m = msgs[0]
+        uid, chat_id = m.from_user.id, m.chat.id
+        async with wiz_locks[uid]:
+            d = await state.get_data()
+            if not d or not wiz_expects_photo(d):
+                return False
+            wiz, step, tok = d["wiz"], d["step"], d["tok"]
+            caption = (next((x.caption for x in msgs if x.caption), "") or "").strip()
+            if wiz == "refimg":
+                have = list(d.get("paths") or [])
+                room = REFIMG_MAX - len(have)
+                if room <= 0:
+                    await m.answer(f"Уже {REFIMG_MAX} фото — это максимум. Напишите, что сгенерировать.")
+                    return True
+                got = 0
+                for x in msgs[:room]:
+                    try:
+                        p = await download_ref(bot, x, d["dir"], f"r_{time.time_ns()}.jpg")
+                        if p:
+                            have.append(p)
+                            got += 1
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("не удалось скачать фото: %s", e)
+                if not got:
+                    await m.answer("😕 Не удалось получить фото. Пришлите JPG/PNG до 20 МБ.")
+                    return True
+                d["paths"] = have
+                if caption:
+                    d["prompt"] = caption[:1500]
+                await state.set_data(d)
+                over = f"\nℹ️ Лимит {REFIMG_MAX} фото — лишние пропущены." if len(msgs) > room else ""
+                if d.get("prompt"):
+                    await refimg_aspect_step(bot, chat_id, state, d)
+                    if over:
+                        await m.answer(over.strip())
+                else:
+                    await m.answer(f"📎 Принято фото: {len(have)} из {REFIMG_MAX}. Добавьте ещё или напишите, что "
+                                   f"сгенерировать по ним.{over}", reply_markup=ikb([cancel_row(tok)]))
+                return True
+            # один файл: картинка для надписи / референс стиля
+            try:
+                p = await download_ref(bot, msgs[0], d.get("dir") or new_tmp_dir(), f"p_{time.time_ns()}.jpg")
+            except Exception as e:  # noqa: BLE001
+                log.warning("не удалось скачать фото: %s", e)
+                p = None
+            if not p:
+                await m.answer("😕 Не удалось получить картинку. Пришлите JPG/PNG до 20 МБ.")
+                return True
+            if step == "sty_ref":
+                await analyze_style_ref(bot, chat_id, uid, state, d, p)
+                return True
+            if step == "ai_ref":
+                d["ref_style"] = p
+                d["ai_desc"] = d.get("ai_desc", "")
+                await caption_ai_color_step(bot, chat_id, state, d)
+                return True
+            d.update(src=p, step="action", dir=os.path.dirname(p))
+            if caption and not caption.startswith("/"):
+                d["text"] = caption[:200]
+            await state.set_state(Wiz.choose)
+            await state.set_data(d)
+            await m.answer("Шаг 2/4. Что сделать с надписью?" + (f"\nТекст из подписи: «{d['text']}»" if d.get("text") else ""),
+                           reply_markup=ikb([[("➕ Добавить текст", wcb(tok, "ca", "a:add"))],
+                                             [("🔁 Заменить текст на картинке", wcb(tok, "ca", "a:replace"))],
+                                             [("🧽 Убрать надпись", wcb(tok, "ca", "a:remove"))], cancel_row(tok)]))
+            return True
+
+    async def wizard_text_ext(m: Message, bot: Bot, state: FSMContext, d: dict, txt: str) -> bool:
+        """Текст в шагах новых мастеров. True — обработано."""
+        wiz, step, tok = d.get("wiz"), d.get("step"), d.get("tok", "")
+        uid, chat_id = m.from_user.id, m.chat.id
+        if step == "sty_hex":
+            hx = textstyle.norm_hex(txt)
+            if not hx:
+                await m.answer("Не похоже на цвет. Формат: #FF8800 (6 символов 0–9, A–F). Попробуйте ещё раз.",
+                               reply_markup=ikb([cancel_row(tok)]))
+                return True
+            sty = d.get("sty") or {}
+            sty["color"] = hx
+            d["sty"] = sty
+            await sty_step_fx(bot, chat_id, state, d)
+            return True
+        if step == "sty_ref" or (wiz == "caption" and step in ("photo", "ai_ref")) or (wiz == "refimg" and False):
+            await m.answer("📎 Здесь жду картинку (фото или файл JPG/PNG). Отмена — «✖️ Отмена» или /cancel.",
+                           reply_markup=ikb([cancel_row(tok)]))
+            return True
+        if wiz == "refimg" and step == "photos":
+            if not d.get("paths"):
+                await m.answer("Сначала пришлите хотя бы одно фото (до 10, можно альбомом).",
+                               reply_markup=ikb([cancel_row(tok)]))
+                return True
+            d["prompt"] = txt[:1500]
+            await refimg_aspect_step(bot, chat_id, state, d)
+            return True
+        if wiz == "caption" and step == "text":
+            d["text"] = txt[:200]
+            await caption_method_step(bot, chat_id, state, d)
+            return True
+        if wiz == "caption" and step == "ai_custom":
+            d["ai_desc"] = txt[:240]
+            await caption_ai_color_step(bot, chat_id, state, d)
+            return True
+        return False
+
+    async def wizard_button_ext(cq: CallbackQuery, bot: Bot, state: FSMContext, d: dict, act: str, val: str) -> bool:
+        """Кнопки новых мастеров (rf — по референсу, ca — надпись, ty — стиль). True — обработано."""
+        wiz, step, tok = d.get("wiz"), d.get("step"), d.get("tok", "")
+        uid = cq.from_user.id
+        chat_id = cq.message.chat.id if cq.message else uid
+        kind, _, arg = val.partition(":")
+        if act == "ty":
+            await style_button(cq, bot, state, d, val)
+            return True
+        if act == "rf" and wiz == "refimg":
+            if kind == "saved" and step == "photos":
+                saved = user_refs(uid)[-REFIMG_MAX:]
+                if not saved:
+                    await bot.send_message(chat_id, "Сохранённых фото нет — просто пришлите фото сюда.")
+                    return True
+                d["paths"] = list(saved)
+                await state.set_data(d)
+                if d.get("prompt"):
+                    await refimg_aspect_step(bot, chat_id, state, d)
+                else:
+                    await bot.send_message(chat_id, f"📎 Взято сохранённых фото: {len(saved)}. Теперь напишите, что "
+                                                    "сгенерировать.", reply_markup=ikb([cancel_row(tok)]))
+                return True
+            if kind == "a" and step == "aspect" and arg in ("auto", "1:1", "9:16", "16:9", "3:4"):
+                await state.clear()
+                params = {"paths": list(d["paths"]), "prompt": d["prompt"], "aspect": arg}
+                await precheck(bot, chat_id, uid, "refimg", params, refimg_estimate(len(d["paths"])))
+                return True
+            return False
+        if act == "ca" and wiz == "caption":
+            if kind == "a" and step == "action" and arg in ("add", "replace", "remove"):
+                d["mode"] = arg
+                if arg == "remove":
+                    d["text"] = ""
+                    d["ai_pos"] = "keep"
+                    await caption_ai_launch(bot, chat_id, uid, state, d)
+                elif d.get("text"):
+                    await caption_method_step(bot, chat_id, state, d)
+                else:
+                    d["step"] = "text"
+                    await state.set_state(Wiz.text)
+                    await state.set_data(d)
+                    await bot.send_message(chat_id, "Шаг 3/4. Напишите текст надписи (до 200 символов)."
+                                           + (" Он заменит старый." if arg == "replace" else ""),
+                                           reply_markup=ikb([cancel_row(tok)]))
+                return True
+            if kind == "m" and step == "method":
+                if arg == "local" and d.get("mode") == "add":
+                    await style_begin(bot, chat_id, uid, state, d)
+                    return True
+                if arg == "ai":
+                    await caption_ai_style_step(bot, chat_id, state, d)
+                    return True
+                return False
+            if kind == "s" and step == "ai_style":
+                if arg in textstyle.AI_STYLES:
+                    d["ai_desc"] = textstyle.AI_STYLES[arg][1]
+                    d["ref_style"] = None
+                    await caption_ai_color_step(bot, chat_id, state, d)
+                elif arg == "custom":
+                    d["step"] = "ai_custom"
+                    await state.set_state(Wiz.text)
+                    await state.set_data(d)
+                    await bot.send_message(chat_id, "✏️ Опишите стиль надписи, например: «толстые буквы из воздушных "
+                                                    "шариков» или «рукописный белый маркер».",
+                                           reply_markup=ikb([cancel_row(tok)]))
+                elif arg == "ref":
+                    d["step"] = "ai_ref"
+                    await state.set_state(Wiz.text)
+                    await state.set_data(d)
+                    await bot.send_message(chat_id, "📷 Пришлите картинку с надписью, чей стиль нужно повторить. "
+                                                    "Копируется только стиль букв, не содержание.",
+                                           reply_markup=ikb([cancel_row(tok)]))
+                else:
+                    return False
+                return True
+            if kind == "c" and step == "ai_color" and arg in dict(textstyle.AI_COLORS):
+                d["ai_color"] = arg
+                if d.get("mode") == "remove":
+                    await caption_ai_launch(bot, chat_id, uid, state, d)
+                else:
+                    await caption_ai_pos_step(bot, chat_id, state, d)
+                return True
+            if kind == "p" and step == "ai_pos" and arg in textstyle.AI_POS:
+                d["ai_pos"] = arg
+                await caption_ai_launch(bot, chat_id, uid, state, d)
+                return True
+            if kind == "re" and step == "after":
+                await style_begin(bot, chat_id, uid, state, d)
+                return True
+            if kind == "done" and step == "after":
+                await state.clear()
+                await bot.send_message(chat_id, "👌 Готово.", reply_markup=main_menu(uid in cfg.admin_user_ids))
+                return True
+        return False
+
     @dp.message(StateFilter(Wiz.text), F.text & ~F.text.startswith("/"), F.chat.type == ChatType.PRIVATE)
     async def on_wizard_text(m: Message, bot: Bot, state: FSMContext) -> None:
         if not allowed(m):
@@ -2898,6 +3713,9 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         d = await state.get_data()
         wiz, step, tok = d.get("wiz"), d.get("step"), d.get("tok", "")
         txt = (m.text or "").strip()
+        if (wiz in ("refimg", "caption", "mystyle") or str(step).startswith("sty_")) \
+                and await wizard_text_ext(m, bot, state, d, txt):
+            return
         if wiz in ("carousel", "story") and step == "topic":
             d.update(topic=txt[:400], step="count")
             await state.set_state(Wiz.choose)
@@ -2956,7 +3774,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             await cq.answer("Этот шаг уже неактуален — нажмите кнопку в меню заново.", show_alert=True)
             return
         await cq.answer()
-        if cq.message:
+        if cq.message and not (act == "ty" and val.startswith("e:") and val != "e:ok"):
             try:
                 await cq.message.edit_reply_markup(reply_markup=None)
             except TelegramBadRequest:
@@ -2967,13 +3785,14 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             return
         wiz = d.get("wiz")
         try:
+            if act in ("ty", "rf", "ca") and await wizard_button_ext(cq, bot, state, d, act, val):
+                return
             if wiz in ("carousel", "story"):
                 if act == "n" and d.get("step") == "count":
                     d["n"] = int(val)
                     k = len(user_refs(uid))
                     if not k:
-                        await state.clear()
-                        await launch_insta(bot, chat_id, uid, wiz, d["topic"], d["n"], False, [], "", None)
+                        await insta_launch(bot, chat_id, uid, state, d, [], "", None)
                         return
                     d["step"] = "mode"
                     await state.set_data(d)
@@ -2984,16 +3803,13 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                         cancel_row(tok)]))
                     return
                 if act == "m" and d.get("step") == "mode":
-                    await state.clear()
                     paths = user_refs(uid)
                     if val == "none" or not paths:
-                        await launch_insta(bot, chat_id, uid, wiz, d["topic"], d["n"], False, [], "", None)
+                        await insta_launch(bot, chat_id, uid, state, d, [], "", None)
                     elif val == "overlay":
-                        await launch_insta(bot, chat_id, uid, wiz, d["topic"], d["n"], False, paths, "сохранённые",
-                                           refs.MODE_OVERLAY)
+                        await insta_launch(bot, chat_id, uid, state, d, paths, "сохранённые", refs.MODE_OVERLAY)
                     else:
-                        await launch_insta(bot, chat_id, uid, wiz, d["topic"], d["n"], False, paths, "сохранённые",
-                                           refs.MODE_EDIT)
+                        await insta_launch(bot, chat_id, uid, state, d, paths, "сохранённые", refs.MODE_EDIT)
                     return
             elif wiz == "video" and act == "s":
                 d.update(seconds=max(1, min(15, int(val))), step="prompt")
@@ -3054,15 +3870,12 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                                                              cancel_row(tok)]))
                     return
                 if act == "n" and step == "count":
+                    if cfg.text_style_step:
+                        d["go"] = {"n": int(val)}
+                        await style_begin(bot, chat_id, uid, state, d)
+                        return
                     await state.clear()
-                    src = d.get("src", "animal")
-                    paths = user_refs(uid) if src in ("edit", "overlay") else []
-                    mode = {"edit": refs.MODE_EDIT, "overlay": refs.MODE_OVERLAY}.get(src) if paths else None
-                    animal = d.get("animal") or memes.random.choice(animals).key
-                    if animal == "photo" and not paths:
-                        animal = memes.random.choice(animals).key
-                    await launch_meme(bot, chat_id, uid, animal, d.get("topic", ""), int(val), bool(d.get("story")),
-                                      paths, "сохранённые" if paths else "", mode)
+                    await meme_launch_now(bot, chat_id, uid, d, int(val))
                     return
         except (ValueError, IndexError):
             pass
@@ -3167,7 +3980,8 @@ def describe(cfg: Config) -> str:
             f"search={cfg.search_mode}({cfg.search_tools}, src≤{cfg.search_max_sources}) "
             f"refs={cfg.ref_mode}/max{cfg.ref_max}/q={cfg.ref_edit_quality}/vision={'on' if cfg.ref_vision else 'off'} "
             f"overlay=max{cfg.ref_overlay_max}/{cfg.overlay_text_pos}/{cfg.overlay_style} "
-            f"meme_topics={len(memes.load_topics(cfg.meme_topics))}")
+            f"meme_topics={len(memes.load_topics(cfg.meme_topics))} "
+            f"text_style_step={'on' if cfg.text_style_step else 'off'} refimg={cfg.refimg_resolution}")
 
 
 async def main() -> int:

@@ -297,11 +297,14 @@ def image_prompt(animal: Animal, scene: str, story: bool, style: str = "") -> st
 # ---------------------------------------------------------------------------
 # Рендер
 # ---------------------------------------------------------------------------
-def _fit_upper(text: str, max_w: int, max_h: int, start: int, minimum: int):
-    text = text.upper()
+def _fit_upper(text: str, max_w: int, max_h: int, start: int, minimum: int, font_ref=None, case: str | None = "upper"):
+    """font_ref — шрифт стиля текста (None — Oswald, как всегда); case — регистр (по умолчанию ЗАГЛАВНЫЕ)."""
+    if case:
+        import textstyle as ts
+        text = ts.apply_case(text, case)
     size = start
     while True:
-        font = insta._font(FONT_MEME, size)
+        font = insta._font(font_ref or FONT_MEME, size)
         sw = max(2, size // 13)
         lines = insta.wrap_text(text, font, max_w - 2 * sw) if text else []
         lh = int(size * 1.08)
@@ -313,7 +316,8 @@ def _fit_upper(text: str, max_w: int, max_h: int, start: int, minimum: int):
 
 
 def render_meme(bg: Image.Image | None, top: str, bottom: str, story: bool = False,
-                watermark: str = "", seed: int = 0) -> Image.Image:
+                watermark: str = "", seed: int = 0, style=None) -> Image.Image:
+    """style — textstyle.TextStyle: шрифт/цвет/регистр/эффекты подписи; None — классический мем (Oswald, белый с обводкой)."""
     size = insta.STORY_SIZE if story else insta.CAROUSEL_SIZE
     W, H = size
     img = insta.fit_cover(bg, size) if bg is not None else placeholder_animal(size, seed)
@@ -324,21 +328,33 @@ def render_meme(bg: Image.Image | None, top: str, bottom: str, story: bool = Fal
     max_h = int((zone_bottom - zone_top) * (0.30 if story else 0.34))
     start = 118 if not story else 124
     layout = {}
+    fx = fref = None
+    if style is not None:
+        import textstyle as ts
+        fx, fref = ts.resolve(style, "meme"), ts.title_ref(style)
+        start, mn = int(start * min(1.15, fx.size_k)), int(46 * min(1, fx.size_k))
+    else:
+        mn = 46
+
+    def put(ln, x, y, font, sw):
+        if fx is None:
+            d.text((x, y), ln, font=font, fill="white", stroke_width=sw, stroke_fill="black")
+        else:
+            ts.draw_line(img, (x, y), ln, font, fx)
+
     if top:
-        lines, font, lh, sw = _fit_upper(top, W - 2 * margin, max_h, start, 46)
+        lines, font, lh, sw = _fit_upper(top, W - 2 * margin, max_h, start, mn, fref, fx.case if fx else "upper")
         y = zone_top
         for ln in lines:
-            w = font.getlength(ln)
-            d.text(((W - w) / 2, y), ln, font=font, fill="white", stroke_width=sw, stroke_fill="black")
+            put(ln, (W - font.getlength(ln)) / 2, y, font, sw)
             y += lh
         layout["top"] = (zone_top, y)
     if bottom:
-        lines, font, lh, sw = _fit_upper(bottom, W - 2 * margin, max_h, start, 46)
+        lines, font, lh, sw = _fit_upper(bottom, W - 2 * margin, max_h, start, mn, fref, fx.case if fx else "upper")
         y = zone_bottom - lh * len(lines) - int(lh * 0.12)
         layout["bottom"] = (y, zone_bottom)
         for ln in lines:
-            w = font.getlength(ln)
-            d.text(((W - w) / 2, y), ln, font=font, fill="white", stroke_width=sw, stroke_fill="black")
+            put(ln, (W - font.getlength(ln)) / 2, y, font, sw)
             y += lh
     if watermark:
         f = insta._font(insta.FONT_SEMI, 26)
