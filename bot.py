@@ -3993,6 +3993,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             await state.set_data(d)
             await m.answer("Шаг 2/2. Формат?", reply_markup=ikb([[("🟦 1:1", wcb(tok, "a", "1:1")),
                                                                  ("📱 9:16", wcb(tok, "a", "9:16"))],
+                                                                [("🖥 Горизонтальное 16:9", wcb(tok, "a", "16:9"))],
                                                                 cancel_row(tok)]))
         elif wiz == "search":
             await state.clear()
@@ -4101,9 +4102,9 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                     d["dir"] = dest
                     await video_prompt_step(bot, chat_id, state, d)
                     return
-            elif wiz == "img" and act == "a" and d.get("prompt"):
+            elif wiz == "img" and act == "a" and d.get("prompt") and val in ("1:1", "9:16", "16:9"):
                 await state.clear()
-                await run_image_wizard(bot, chat_id, d["prompt"], "9:16" if val == "9:16" else "1:1")
+                await run_image_wizard(bot, chat_id, d["prompt"], val)
                 return
             elif wiz == "meme":
                 step = d.get("step")
