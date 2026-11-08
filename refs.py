@@ -48,6 +48,48 @@ def split_flags(raw: str) -> tuple[str, str | None, bool]:
     return " ".join(rest), mode, noref
 
 
+class StillError(ValueError):
+    """Кадр для image-to-video не принят. code: empty | too_big | format | pixels | unreadable."""
+
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+STILL_FORMATS = frozenset({"JPEG", "PNG", "WEBP"})  # Videos API: image.url — JPEG, PNG или WebP
+STILL_MAX_BYTES = 20 * 1024 * 1024  # Bot API отдаёт файл до 20 МБ
+VIDEO_STILL_MAX_SIDE = 1536  # длинная сторона data URI в image-to-video (меньше JSON и RAM)
+
+
+def save_video_still(data: bytes, path: str, max_bytes: int = STILL_MAX_BYTES) -> tuple[int, int]:
+    """Проверяет байты кадра (JPEG/PNG/WebP) и сохраняет их как референс: EXIF-поворот, лимит стороны."""
+    if not data:
+        raise StillError("empty")
+    if len(data) > max_bytes:
+        raise StillError("too_big")
+    try:
+        with Image.open(io.BytesIO(data)) as im:
+            fmt = (im.format or "").upper()
+    except Exception as e:
+        raise StillError("unreadable") from e
+    if fmt not in STILL_FORMATS:
+        raise StillError("format")
+    try:
+        return save_ref(data, path, REF_MAX_SIDE)
+    except ValueError as e:
+        raise StillError("pixels") from e
+    except Exception as e:
+        raise StillError("unreadable") from e
+
+
+def video_still_data_uri(path: str, max_side: int = VIDEO_STILL_MAX_SIDE) -> str:
+    """Локальный файл → data:image/jpeg;base64,... для поля image.url. Не URL Telegram."""
+    uri = data_uri(path, max_side)
+    if (not uri.startswith("data:image/jpeg;base64,") or "api.telegram.org" in uri or "/file/bot" in uri):
+        raise StillError("format")
+    return uri
+
+
 def save_ref(data: bytes, path: str, max_side: int = REF_MAX_SIDE) -> tuple[int, int]:
     """Открывает фото (JPEG/PNG/WebP), поворачивает по EXIF, уменьшает и сохраняет JPEG."""
     im = Image.open(io.BytesIO(data))

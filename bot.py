@@ -4,6 +4,8 @@ aiogram 3 (long polling) + httpx -> xAI REST API (https://api.x.ai/v1).
 
 Чат:      POST /v1/responses (основной текстовый API xAI; Chat Completions у xAI — legacy).
 Картинки: POST /v1/images/generations, response_format="b64_json".
+Видео:    POST /v1/videos/generations → GET /v1/videos/{request_id}.
+          По фото: то же, поле image.url = data URI скачанных байтов (image-to-video).
 Стоимость: usage.cost_in_usd_ticks в каждом ответе (1 USD = 10^10 тиков), docs.x.ai/developers/cost-tracking.
 Баланс:   GET https://management-api.x.ai/v1/billing/teams/{team_id}/prepaid/balance (нужен management key)
           или локальный счётчик: START_BALANCE_USD / /setbalance минус потраченное.
@@ -814,13 +816,53 @@ class XAIClient:
 
 
     # --- видео (асинхронно: старт -> опрос) ---
+    @staticmethod
+    def _video_image_field(image_url: str) -> dict:
+        """image.url для image-to-video: только data URI скачанных байтов.
+
+        Публичный URL в API допустим, но ссылка Telegram (api.telegram.org/file/bot…)
+        приватная и содержит токен — её в xAI не отправляем.
+        Документация: docs.x.ai/developers/model-capabilities/video/image-to-video
+        и REST image.url (JPEG, PNG, WebP).
+        """
+        raw = (image_url or "").strip()
+        low = raw.lower()
+        if ("api.telegram.org" in low or "/file/bot" in low or low.startswith("http://")
+                or low.startswith("https://")):
+            raise XAIError("bad_request", detail="refusing remote image url")
+        head, sep, b64 = raw.partition(",")
+        mime = head[5:].split(";", 1)[0].lower() if head.lower().startswith("data:image/") else ""
+        if sep != "," or ";base64" not in head.lower() or not b64 or mime not in (
+                "image/jpeg", "image/png", "image/webp"):
+            raise XAIError("bad_request", detail="image must be a jpeg/png/webp data URI")
+        return {"url": raw}
+
     async def video_start(self, prompt: str, duration: int, aspect_ratio: str = "9:16",
-                          resolution: str | None = None) -> str:
-        payload = {"model": self.cfg.video_model, "prompt": prompt, "duration": duration,
-                   "aspect_ratio": aspect_ratio}
+                          resolution: str | None = None, image_url: str | None = None) -> str:
+        """POST /v1/videos/generations. С image_url — image-to-video (кадр = первый кадр).
+
+        aspect_ratio для image-to-video не передаём: по документации поле игнорируется,
+        ролик совпадает с пропорциями фото. Повтор этого запроса здесь не делается:
+        таймаут мог означать, что задача уже принята, и второй POST списал бы оплату ещё раз.
+        """
+        duration = max(1, min(15, int(duration)))
+        text = (prompt or "").strip()
+        payload: dict = {"model": self.cfg.video_model, "duration": duration}
+        if image_url:
+            payload["image"] = self._video_image_field(image_url)
+            if text:
+                payload["prompt"] = text
+        else:
+            if not text:
+                raise XAIError("bad_request", detail="prompt required")
+            payload["prompt"] = text
+            payload["aspect_ratio"] = aspect_ratio
         if resolution:
             payload["resolution"] = resolution
-        data = await self._post("/videos/generations", payload)
+        try:
+            data = await self._post("/videos/generations", payload)
+        finally:
+            payload.clear()
         rid = data.get("request_id")
         if not rid:
             raise XAIError("empty", detail="no request_id")
@@ -1010,6 +1052,17 @@ def error_text(e: XAIError) -> str:
             "или не работает прокси.\nВладельцу: проверьте XAI_PROXY (или задайте его, если сервер в РФ)."
         )
     return "🤷 Grok вернул пустой ответ. Попробуйте ещё раз или /new."
+
+
+def still_error_text(e: refs.StillError) -> str:
+    """Понятная ошибка кадра для видео по фото (форматы — из Videos API: JPEG, PNG, WebP)."""
+    return {
+        "empty": "Файл пустой. Пришлите фото или файл JPG, PNG или WebP.",
+        "too_big": "📦 Файл больше 20 МБ — Telegram не отдаёт такие файлы боту. Сожмите картинку и пришлите снова.",
+        "format": "Этот формат не подходит. Для видео нужно фото JPG, PNG или WebP.",
+        "pixels": "📦 Слишком большое изображение по пикселям. Пришлите файл поменьше.",
+        "unreadable": "😕 Не удалось прочитать изображение. Пришлите обычное фото или файл JPG, PNG, WebP.",
+    }.get(getattr(e, "code", ""), "😕 Не удалось принять изображение. Пришлите JPG, PNG или WebP до 20 МБ.")
 
 
 def split_text(text: str, limit: int = TG_LIMIT) -> list[str]:
@@ -1537,6 +1590,25 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             release_memory()
         return path
 
+    async def download_video_still(bot: Bot, msg: Message, dest: str) -> str:
+        """Скачивает байты фото/документа и проверяет JPEG/PNG/WebP. Ссылку Telegram наружу не отдаёт."""
+        f = photo_file(msg)
+        if not f:
+            raise refs.StillError("format")
+        fid, size = f
+        if size > refs.STILL_MAX_BYTES:
+            raise refs.StillError("too_big")
+        os.makedirs(dest, exist_ok=True)
+        buf = await bot.download(fid)
+        path = os.path.join(dest, "still.jpg")
+        try:
+            raw = buf.getvalue()
+            await asyncio.to_thread(refs.save_video_still, raw, path)
+        finally:
+            buf.close()
+            release_memory()
+        return path
+
     async def resolve_refs(m: Message, bot: Bot, noref: bool) -> tuple[list[str], str]:
         """Референсы для команды: фото, на которое ответили командой, иначе сохранённые /ref."""
         if photo_file(m.reply_to_message):
@@ -1991,24 +2063,68 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             os.remove(zpath)
         return True
 
+    def _usage_cost(data: dict, fallback: Cost) -> Cost | None:
+        usage = data.get("usage") or {}
+        if usage.get("cost_in_usd_ticks") is not None or usage.get("cost_in_nano_usd") is not None:
+            return cost_from_usage(usage, cfg)
+        return fallback
+
     async def run_video(bot: Bot, chat_id: int, prompt: str, seconds: int, title: str = "",
-                        spend: "Spend | None" = None, status: Message | None = None) -> None:
+                        spend: "Spend | None" = None, status: Message | None = None,
+                        image_path: str | None = None) -> None:
         spend = spend or Spend(bot)
+        seconds = max(1, min(15, int(seconds)))
+        from_photo = bool(image_path)
+        image_uri = None
+        if image_path:
+            if not os.path.exists(image_path):
+                await bot.send_message(chat_id, "📎 Фото не найдено (хранится ограниченное время). "
+                                                "Пришлите его ещё раз: «🎬 Видео» → «По фото».")
+                return
+            try:
+                image_uri = await asyncio.to_thread(refs.video_still_data_uri, image_path, refs.VIDEO_STILL_MAX_SIDE)
+            except refs.StillError as e:
+                await bot.send_message(chat_id, still_error_text(e))
+                return
         est = seconds * cfg.video_price()
-        text = f"🎬 Запускаю генерацию видео {seconds} сек, 9:16 (оценка ≈{fmt_cost(est)})…"
+        if image_uri:
+            text = (f"🎬 Запускаю видео по вашему фото, {seconds} сек, {cfg.video_resolution} "
+                    f"(первый кадр — это фото, оценка ≈{fmt_cost(est)})…")
+            full_prompt = (prompt or "").strip()
+            if cfg.brand_style:
+                full_prompt = (full_prompt + f" Style: {cfg.brand_style}.").strip()
+        else:
+            text = f"🎬 Запускаю генерацию видео {seconds} сек, 9:16 (оценка ≈{fmt_cost(est)})…"
+            full_prompt = f"{prompt}. Vertical 9:16 video for Instagram Stories."
+            if cfg.brand_style:
+                full_prompt += f" Style: {cfg.brand_style}."
         if status is None:
             status = await bot.send_message(chat_id, text)
         else:
             await status_edit(status, text)
-        full_prompt = f"{prompt}. Vertical 9:16 video for Instagram Stories."
-        if cfg.brand_style:
-            full_prompt += f" Style: {cfg.brand_style}."
         try:
-            rid = await xai.video_start(full_prompt, seconds, "9:16", cfg.video_resolution)
+            rid = await xai.video_start(full_prompt, seconds, "9:16", cfg.video_resolution, image_url=image_uri)
         except XAIError as e:
             log.error("video start: %s", e)
-            await status_edit(status, error_text(e) + ("\n\n" + spend.line() if spend.usd else ""))
+            note = ""
+            if e.kind in ("timeout", "network"):
+                note = ("\n\nПовторно запрос не отправляю: если xAI его уже принял, вторая попытка "
+                        "списала бы оплату ещё раз. Проверьте /balance чуть позже.")
+            await status_edit(status, error_text(e) + note + ("\n\n" + spend.line() if spend.usd else ""))
             return
+        finally:
+            image_uri = None
+            release_memory()
+        billed = False
+
+        async def charge_once(cost: Cost | None) -> None:
+            """Один и тот же request_id учитываем один раз, даже если опрос повторили."""
+            nonlocal billed
+            if billed or cost is None:
+                return
+            billed = True
+            await spend.add(cost)
+
         t0, last_edit, last_prog = time.monotonic(), 0.0, None
         data: dict = {}
         while True:
@@ -2017,7 +2133,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                 data = await xai.video_get(rid)
             except XAIError as e:
                 if e.kind in ("network", "timeout", "server") and time.monotonic() - t0 < cfg.video_timeout_sec:
-                    log.warning("video poll: %s — повторю", e)
+                    log.warning("video poll: %s — повторю опрос, новый запрос не создаю", e)
                     continue
                 await status_edit(status, error_text(e))
                 return
@@ -2026,39 +2142,48 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                 break
             if st in ("failed", "expired"):
                 err = (data.get("error") or {}).get("message") or st
-                if (data.get("usage") or {}).get("cost_in_usd_ticks"):
-                    await spend.add(cost_from_usage(data.get("usage"), cfg))
+                # Промежуточный progress тоже может прийти с usage — деньги берём только из финального статуса.
+                if (data.get("usage") or {}).get("cost_in_usd_ticks") is not None \
+                        or (data.get("usage") or {}).get("cost_in_nano_usd") is not None:
+                    await charge_once(cost_from_usage(data.get("usage"), cfg))
                 await status_edit(status, f"❌ Видео не получилось: {err[:300]}" +
                                   ("\n\n" + spend.line() if spend.usd else ""))
                 return
             if time.monotonic() - t0 > cfg.video_timeout_sec:
                 await status_edit(status, "⌛ Видео генерируется слишком долго — остановил ожидание. "
+                                          "Новый запрос не отправляю, чтобы не списать оплату дважды. "
                                           "Стоимость могла списаться; проверьте /balance позже.")
                 return
             prog = data.get("progress")
             if prog != last_prog and time.monotonic() - last_edit > 10:
                 last_prog, last_edit = prog, time.monotonic()
-                await status_edit(status, f"🎬 Генерирую видео… {prog if prog is not None else '…'}%")
-        usage = data.get("usage")
+                word = "Оживляю фото" if from_photo else "Генерирую видео"
+                await status_edit(status, f"🎬 {word}… {prog if prog is not None else '…'}%")
         vid = data.get("video") or {}
         dur = int(vid.get("duration") or seconds)
-        cost = cost_from_usage(usage, cfg) if (usage or {}).get("cost_in_usd_ticks") is not None \
-            else Cost(dur * cfg.video_price(), False)
-        await spend.add(cost)
+        await charge_once(_usage_cost(data, Cost(dur * cfg.video_price(), False)))
         if vid.get("respect_moderation") is False or not vid.get("url"):
             await status_edit(status, "🚫 Видео не прошло модерацию xAI (ссылка не выдана).\n\n" + spend.line("видео"))
             return
         jdir = os.path.join(work_root, "v" + secrets.token_hex(5))
         os.makedirs(jdir, exist_ok=True)
         path = os.path.join(jdir, "story.mp4")
+        caption = ((title or ("🖼 " if from_photo else "🎬 ") + (prompt or ""))[:800]
+                   + "\n\n" + spend.line(f"видео {dur} сек"))[:1024]
         try:
             await status_edit(status, "📥 Скачиваю видео…")
             await xai.download(vid["url"], path)
-            await bot.send_video(chat_id, FSInputFile(path), supports_streaming=True,
-                                 caption=((title or f"🎬 {prompt}")[:800] + "\n\n" + spend.line(f"видео {dur} сек"))[:1024])
+            try:
+                await bot.send_video(chat_id, FSInputFile(path), supports_streaming=True, caption=caption)
+            except TelegramBadRequest as e:
+                log.warning("send_video failed (%s), sending as document", e)
+                await bot.send_document(chat_id, FSInputFile(path), caption=caption)
             await status_delete(status)
         except XAIError as e:
             await status_edit(status, error_text(e) + "\n\n" + spend.line("видео"))
+        except TelegramBadRequest as e:
+            log.warning("video deliver failed: %s", e)
+            await status_edit(status, "😕 Видео скачано, но Telegram его не принял.\n\n" + spend.line("видео"))
         finally:
             shutil.rmtree(jdir, ignore_errors=True)
 
@@ -2126,19 +2251,57 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         await precheck(bot, chat_id, uid, kind, {"topic": topic, "n": n, "as_zip": as_zip, "ref_paths": ref_paths,
                                                  "ref_mode": mode, "ref_source": ref_source}, est)
 
+    async def handle_storyvideo_photo(m: Message, bot: Bot, raw: str, path: str, n_msgs: int) -> None:
+        n, prompt, _z, err = parse_args(raw, "storyvideo")
+        if err:
+            await m.answer(err + "\n\nНапример:\n/storyvideo 6 камера медленно приближается, лёгкий ветер")
+            return
+        if not prompt:
+            await m.answer("Добавьте в подпись, как оживить фото, например:\n"
+                           "/storyvideo 6 камера медленно приближается, лёгкий ветер")
+            return
+        if n_msgs > 1:
+            await m.answer("ℹ️ Для видео по фото беру только первое изображение — оно станет первым кадром.")
+        seconds = n or max(1, min(15, cfg.video_duration))
+        await precheck_and_run(m, bot, "storyvideo",
+                               {"prompt": prompt, "seconds": seconds, "image_path": path},
+                               seconds * cfg.video_price())
+
     @dp.message(Command("storyvideo"))
     async def cmd_storyvideo(m: Message, command: CommandObject, bot: Bot) -> None:
         if not allowed(m):
             await deny(m)
             return
         n, prompt, _z, err = parse_args(command.args or "", "storyvideo")
-        if err or not prompt:
-            await m.answer((err + "\n\n" if err else "") + "Опишите видео, например:\n"
+        if err:
+            await m.answer(err + "\n\nНапример:\n"
                            "/storyvideo 6 чашка кофе на подоконнике, пар, утренний свет, камера медленно приближается")
             return
+        image_path = None
+        if photo_file(m.reply_to_message):
+            try:
+                image_path = await download_video_still(bot, m.reply_to_message, new_tmp_dir())
+            except refs.StillError as e:
+                await m.answer(still_error_text(e))
+                return
+            except Exception as e:  # noqa: BLE001
+                log.warning("не удалось скачать фото из ответа для видео: %s", e)
+                await m.answer(still_error_text(refs.StillError("unreadable")))
+                return
+        if image_path and not prompt:
+            await m.answer("Добавьте, как оживить фото, например:\n"
+                           "/storyvideo 6 камера медленно приближается, лёгкий ветер")
+            return
+        if not prompt:
+            await m.answer("Опишите видео, например:\n"
+                           "/storyvideo 6 чашка кофе на подоконнике, пар, утренний свет, камера медленно приближается\n\n"
+                           "Чтобы оживить картинку: пришлите фото с такой подписью или нажмите «🎬 Видео» → «По фото».")
+            return
         seconds = n or max(1, min(15, cfg.video_duration))
-        await precheck_and_run(m, bot, "storyvideo", {"prompt": prompt, "seconds": seconds},
-                               seconds * cfg.video_price())
+        params: dict = {"prompt": prompt, "seconds": seconds}
+        if image_path:
+            params["image_path"] = image_path
+        await precheck_and_run(m, bot, "storyvideo", params, seconds * cfg.video_price())
 
     @dp.callback_query(F.data.regexp(r"^(go|no|zip):[0-9a-f]+$"))
     async def on_callback(cq: CallbackQuery, bot: Bot) -> None:
@@ -2618,7 +2781,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
     # ------------------------------------------------------------------
     # Референсы: фото, альбомы, /ref
     # ------------------------------------------------------------------
-    PHOTO_COMMANDS = {"carousel", "story", "meme", "meme5", "img"}
+    PHOTO_COMMANDS = {"carousel", "story", "meme", "meme5", "img", "storyvideo"}
 
     async def on_photo(m: Message, bot: Bot, state: FSMContext | None = None) -> None:
         if not allowed(m):
@@ -2656,6 +2819,18 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         cmd = cm.group(1).lower() if cm else ""
         args = (cm.group(2) or "") if cm else ""
         if cm and cmd in PHOTO_COMMANDS:
+            if cmd == "storyvideo":
+                try:
+                    path = await download_video_still(bot, msgs[0], new_tmp_dir())
+                except refs.StillError as e:
+                    await m.answer(still_error_text(e))
+                    return
+                except Exception as e:  # noqa: BLE001
+                    log.warning("не удалось скачать фото для видео: %s", e)
+                    await m.answer(still_error_text(refs.StillError("unreadable")))
+                    return
+                await handle_storyvideo_photo(m, bot, args, path, len(msgs))
+                return
             flag = refs.split_flags(args)[1]
             overlay = cmd != "img" and (flag or default_mode(m.from_user.id)) == refs.MODE_OVERLAY
             limit = cfg.ref_overlay_max if overlay else cfg.ref_max
@@ -2684,7 +2859,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                 await handle_img(m, bot, args, paths)
             return
         if cm:
-            await m.answer(f"Команда /{cmd} не работает с фото. С фото: /carousel, /story, /meme, /img.")
+            await m.answer(f"Команда /{cmd} не работает с фото. С фото: /carousel, /story, /meme, /img, /storyvideo.")
             return
         # Без команды — сохраняем как референсы пользователя.
         uid = m.from_user.id
@@ -2809,6 +2984,46 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         await state.set_data({"wiz": wiz, "tok": tok, **data})
         return tok
 
+    async def video_source_step(bot: Bot, chat_id: int, state: FSMContext, d: dict) -> None:
+        tok = d["tok"]
+        d["step"] = "source"
+        d.pop("image", None)
+        await state.set_state(Wiz.choose)
+        await state.set_data(d)
+        await bot.send_message(chat_id, "Шаг 2/3. Как сделать видео?",
+                               reply_markup=ikb([[("✍️ По описанию", wcb(tok, "v", "text")),
+                                                  ("🖼 По фото", wcb(tok, "v", "photo"))], cancel_row(tok)]))
+
+    async def video_photo_step(bot: Bot, chat_id: int, uid: int, state: FSMContext, d: dict) -> None:
+        tok = d["tok"]
+        d["step"] = "photo"
+        d["dir"] = d.get("dir") or new_tmp_dir()
+        await state.set_state(Wiz.text)
+        await state.set_data(d)
+        rows: list[list[tuple[str, str]]] = []
+        if user_refs(uid):
+            rows.append([("📎 Последнее сохранённое", wcb(tok, "v", "saved"))])
+        rows.append(cancel_row(tok))
+        await bot.send_message(
+            chat_id,
+            "Шаг 3/4. Пришлите фото, которое нужно оживить: кадр из чата или файл JPG, PNG, WebP до 20 МБ.\n"
+            "Можно сразу написать в подписи, как оно двигается, например: «камера медленно приближается, лёгкий ветер».\n"
+            "Это фото станет первым кадром, пропорции ролика совпадут с ним.",
+            reply_markup=ikb(rows))
+
+    async def video_prompt_step(bot: Bot, chat_id: int, state: FSMContext, d: dict) -> None:
+        tok = d["tok"]
+        d["step"] = "prompt"
+        await state.set_state(Wiz.text)
+        await state.set_data(d)
+        if d.get("image"):
+            text = ("Шаг 4/4. Как оживить это фото? Опишите движение, например: "
+                    "человек поворачивает голову и улыбается, камера чуть отъезжает")
+        else:
+            text = ("Шаг 3/3. Опишите вертикальное видео 9:16, например: чашка кофе на подоконнике, пар, "
+                    "утренний свет, камера медленно приближается")
+        await bot.send_message(chat_id, text, reply_markup=ikb([cancel_row(tok)]))
+
     @dp.message.outer_middleware()
     async def reset_wizard_on_command(handler, event: Message, data: dict):
         """Любая /команда посреди мастера закрывает мастер (старые команды работают как раньше)."""
@@ -2846,7 +3061,7 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
         elif t == MENU_VIDEO:
             tok = await wiz_new(state, "video", Wiz.choose, step="seconds")
             secs = [s for s in (5, 8, 10, 15)]
-            await m.answer(f"🎬 Видео 9:16 — шаг 1/2. Длительность? (≈{fmt_cost(cfg.video_price())}/сек)",
+            await m.answer(f"🎬 Видео — шаг 1/3. Длительность? (≈{fmt_cost(cfg.video_price())}/сек)",
                            reply_markup=ikb([[(f"{s} сек", wcb(tok, "s", s)) for s in secs], cancel_row(tok)]))
         elif t == MENU_IMG:
             tok = await wiz_new(state, "img", Wiz.text, step="prompt")
@@ -3500,19 +3715,44 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
     def wiz_expects_photo(d: dict) -> bool:
         wiz, step = d.get("wiz"), d.get("step")
         return bool((wiz == "refimg" and step == "photos") or (wiz == "caption" and step in ("photo", "ai_ref"))
-                    or step == "sty_ref")
+                    or (wiz == "video" and step == "photo") or step == "sty_ref")
 
     async def wizard_photos(msgs: list[Message], bot: Bot, state: FSMContext) -> bool:
         """Фото, пришедшее посреди мастера. True — фото обработано мастером."""
         m = msgs[0]
         uid, chat_id = m.from_user.id, m.chat.id
+        launch: dict | None = None
         async with wiz_locks[uid]:
             d = await state.get_data()
             if not d or not wiz_expects_photo(d):
                 return False
             wiz, step, tok = d["wiz"], d["step"], d["tok"]
             caption = (next((x.caption for x in msgs if x.caption), "") or "").strip()
-            if wiz == "refimg":
+            if wiz == "video" and step == "photo":
+                note = ("ℹ️ Для видео берётся только первое фото — оно станет первым кадром."
+                        if len(msgs) > 1 else "")
+                try:
+                    p = await download_video_still(bot, msgs[0], d.get("dir") or new_tmp_dir())
+                except refs.StillError as e:
+                    await m.answer(still_error_text(e), reply_markup=ikb([cancel_row(tok)]))
+                    return True
+                except Exception as e:  # noqa: BLE001
+                    log.warning("не удалось скачать кадр для видео: %s", e)
+                    await m.answer(still_error_text(refs.StillError("unreadable")),
+                                   reply_markup=ikb([cancel_row(tok)]))
+                    return True
+                d["image"] = p
+                d["dir"] = os.path.dirname(p)
+                cap = caption if caption and not caption.startswith("/") else ""
+                if not cap:
+                    await video_prompt_step(bot, chat_id, state, d)
+                    if note:
+                        await m.answer(note)
+                    return True
+                sec = max(1, min(15, int(d.get("seconds") or cfg.video_duration)))
+                await state.clear()
+                launch = {"prompt": cap[:1500], "seconds": sec, "image_path": p, "note": note}
+            elif wiz == "refimg":
                 have = list(d.get("paths") or [])
                 room = REFIMG_MAX - len(have)
                 if room <= 0:
@@ -3543,33 +3783,42 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                     await m.answer(f"📎 Принято фото: {len(have)} из {REFIMG_MAX}. Добавьте ещё или напишите, что "
                                    f"сгенерировать по ним.{over}", reply_markup=ikb([cancel_row(tok)]))
                 return True
-            # один файл: картинка для надписи / референс стиля
-            try:
-                p = await download_ref(bot, msgs[0], d.get("dir") or new_tmp_dir(), f"p_{time.time_ns()}.jpg")
-            except Exception as e:  # noqa: BLE001
-                log.warning("не удалось скачать фото: %s", e)
-                p = None
-            if not p:
-                await m.answer("😕 Не удалось получить картинку. Пришлите JPG/PNG до 20 МБ.")
+            else:
+                # один файл: картинка для надписи / референс стиля
+                try:
+                    p = await download_ref(bot, msgs[0], d.get("dir") or new_tmp_dir(), f"p_{time.time_ns()}.jpg")
+                except Exception as e:  # noqa: BLE001
+                    log.warning("не удалось скачать фото: %s", e)
+                    p = None
+                if not p:
+                    await m.answer("😕 Не удалось получить картинку. Пришлите JPG/PNG до 20 МБ.")
+                    return True
+                if step == "sty_ref":
+                    await analyze_style_ref(bot, chat_id, uid, state, d, p)
+                    return True
+                if step == "ai_ref":
+                    d["ref_style"] = p
+                    d["ai_desc"] = d.get("ai_desc", "")
+                    await caption_ai_color_step(bot, chat_id, state, d)
+                    return True
+                d.update(src=p, step="action", dir=os.path.dirname(p))
+                if caption and not caption.startswith("/"):
+                    d["text"] = caption[:200]
+                await state.set_state(Wiz.choose)
+                await state.set_data(d)
+                await m.answer("Шаг 2/4. Что сделать с надписью?" + (f"\nТекст из подписи: «{d['text']}»" if d.get("text") else ""),
+                               reply_markup=ikb([[("➕ Добавить текст", wcb(tok, "ca", "a:add"))],
+                                                 [("🔁 Заменить текст на картинке", wcb(tok, "ca", "a:replace"))],
+                                                 [("🧽 Убрать надпись", wcb(tok, "ca", "a:remove"))], cancel_row(tok)]))
                 return True
-            if step == "sty_ref":
-                await analyze_style_ref(bot, chat_id, uid, state, d, p)
-                return True
-            if step == "ai_ref":
-                d["ref_style"] = p
-                d["ai_desc"] = d.get("ai_desc", "")
-                await caption_ai_color_step(bot, chat_id, state, d)
-                return True
-            d.update(src=p, step="action", dir=os.path.dirname(p))
-            if caption and not caption.startswith("/"):
-                d["text"] = caption[:200]
-            await state.set_state(Wiz.choose)
-            await state.set_data(d)
-            await m.answer("Шаг 2/4. Что сделать с надписью?" + (f"\nТекст из подписи: «{d['text']}»" if d.get("text") else ""),
-                           reply_markup=ikb([[("➕ Добавить текст", wcb(tok, "ca", "a:add"))],
-                                             [("🔁 Заменить текст на картинке", wcb(tok, "ca", "a:replace"))],
-                                             [("🧽 Убрать надпись", wcb(tok, "ca", "a:remove"))], cancel_row(tok)]))
-            return True
+        if launch:
+            if launch.get("note"):
+                await m.answer(launch["note"])
+            await precheck(bot, chat_id, uid, "storyvideo",
+                           {"prompt": launch["prompt"], "seconds": launch["seconds"],
+                            "image_path": launch["image_path"]},
+                           launch["seconds"] * cfg.video_price())
+        return True
 
     async def wizard_text_ext(m: Message, bot: Bot, state: FSMContext, d: dict, txt: str) -> bool:
         """Текст в шагах новых мастеров. True — обработано."""
@@ -3723,10 +3972,21 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             what = "слайдов" if wiz == "carousel" else "кадров"
             await m.answer(f"Шаг 2/3. Сколько {what}?",
                            reply_markup=ikb([[(str(x), wcb(tok, "n", x)) for x in (3, 5, 7, 10)], cancel_row(tok)]))
+        elif wiz == "video" and step == "photo":
+            await m.answer("📎 Здесь нужно фото или файл JPG, PNG, WebP (до 20 МБ), а не текст.\n"
+                           "Подпись к фото — это описание движения.",
+                           reply_markup=ikb([cancel_row(tok)]))
         elif wiz == "video" and step == "prompt":
+            if len(txt) < 2:
+                await m.answer("Опишите движение чуть подробнее — хотя бы пару слов.",
+                               reply_markup=ikb([cancel_row(tok)]))
+                return
             await state.clear()
-            sec = int(d.get("seconds") or cfg.video_duration)
-            await precheck_and_run(m, bot, "storyvideo", {"prompt": txt, "seconds": sec}, sec * cfg.video_price())
+            sec = max(1, min(15, int(d.get("seconds") or cfg.video_duration)))
+            params = {"prompt": txt[:1500], "seconds": sec}
+            if d.get("image"):
+                params["image_path"] = d["image"]
+            await precheck_and_run(m, bot, "storyvideo", params, sec * cfg.video_price())
         elif wiz == "img" and step == "prompt":
             d.update(prompt=txt[:1500], step="aspect")
             await state.set_state(Wiz.choose)
@@ -3811,14 +4071,36 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
                     else:
                         await insta_launch(bot, chat_id, uid, state, d, paths, "сохранённые", refs.MODE_EDIT)
                     return
-            elif wiz == "video" and act == "s":
-                d.update(seconds=max(1, min(15, int(val))), step="prompt")
-                await state.set_state(Wiz.text)
-                await state.set_data(d)
-                await bot.send_message(chat_id, "Шаг 2/2. Опишите видео, например: чашка кофе на подоконнике, пар, "
-                                                "утренний свет, камера медленно приближается",
-                                       reply_markup=ikb([cancel_row(tok)]))
+            elif wiz == "video" and act == "s" and d.get("step") == "seconds":
+                d["seconds"] = max(1, min(15, int(val)))
+                await video_source_step(bot, chat_id, state, d)
                 return
+            elif wiz == "video" and act == "v":
+                if val == "text" and d.get("step") == "source":
+                    d.pop("image", None)
+                    await video_prompt_step(bot, chat_id, state, d)
+                    return
+                if val == "photo" and d.get("step") == "source":
+                    await video_photo_step(bot, chat_id, uid, state, d)
+                    return
+                if val == "saved" and d.get("step") == "photo":
+                    paths = user_refs(uid)
+                    if not paths:
+                        await bot.send_message(chat_id, "Сохранённых фото нет — пришлите кадр сюда.",
+                                               reply_markup=ikb([cancel_row(tok)]))
+                        return
+                    dest = d.get("dir") or new_tmp_dir()
+                    dst = os.path.join(dest, "still.jpg")
+                    try:
+                        shutil.copyfile(paths[-1], dst)
+                    except OSError:
+                        await bot.send_message(chat_id, "😕 Не удалось взять сохранённое фото. Пришлите его ещё раз.",
+                                               reply_markup=ikb([cancel_row(tok)]))
+                        return
+                    d["image"] = dst
+                    d["dir"] = dest
+                    await video_prompt_step(bot, chat_id, state, d)
+                    return
             elif wiz == "img" and act == "a" and d.get("prompt"):
                 await state.clear()
                 await run_image_wizard(bot, chat_id, d["prompt"], "9:16" if val == "9:16" else "1:1")
@@ -3953,10 +4235,16 @@ def build_dispatcher(cfg: Config, xai: XAIClient, tracker: BalanceTracker,
             await m.answer(chunk, parse_mode="HTML", link_preview_options=LinkPreviewOptions(is_disabled=True))
 
     @dp.message(F.chat.type == ChatType.PRIVATE)
-    async def on_other(m: Message) -> None:
+    async def on_other(m: Message, state: FSMContext) -> None:
         if not allowed(m):
             await deny(m)
             return
+        if m.document is not None:
+            d = await state.get_data()
+            if d.get("wiz") == "video" and d.get("step") == "photo":
+                await m.answer("Этот файл не подходит для видео. Пришлите фото или файл JPG, PNG или WebP до 20 МБ.",
+                               reply_markup=ikb([cancel_row(d.get("tok") or "")]))
+                return
         await m.answer("Я понимаю текст и фото (фото = референсы, см. /ref). Команды: /start, /img, /meme, /memevideo, "
                        "/carousel, /story, /storyvideo, /ref, /search, /new, /balance, /myid")
 
